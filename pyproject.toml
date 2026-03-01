@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arcushub"
+version = "0.1.0"
+description = "Arcus hub management tools"
+requires-python = ">=3.9"
+dependencies = [
+    "click",
+    "paramiko",
+]
+
+[tool.setuptools.packages.find]
+include = ["arcushub*"]
+
+[project.scripts]
+arcushub = "arcushub.cli:cli"
