@@ -136,6 +136,9 @@ def login(host, port, user, password):
         client.close()
 
 
+cli.add_command(login, "ssh")
+
+
 @cli.command("debug-key")
 @click.argument("hub_id")
 @click.option("--data-dir", type=click.Path(exists=True, path_type=Path), default=_DEFAULT_DATA_DIR, help="Path to hub data directory.")
