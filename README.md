@@ -132,7 +132,7 @@ arcushub agent-install LWR-2389 iris-agent-hub.tgz
 
 #### `arcushub scp <src> <dst>`
 
-Copy files to or from a hub using `HOST:PATH` syntax.
+Copy files to or from a hub over SSH using `HOST:PATH` syntax.
 
 ```sh
 arcushub scp firmware.bin LWR-2389:/tmp/

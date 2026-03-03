@@ -397,7 +397,7 @@ def agent_install(host, tarfile, port, user, password):
 @click.option("--user", default="root", help="SSH username.")
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
 def scp(src, dst, port, user, password):
-    """Copy files to/from a hub via SCP.
+    """Copy files to/from a hub over SSH.
 
     Use HOST:PATH syntax for remote paths, where HOST can be an IP or hub ID.
 
