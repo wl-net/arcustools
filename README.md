@@ -26,14 +26,14 @@ Hub IDs are derived from the hub's MAC address using a base-23 encoding scheme. 
 
 ### Commands
 
-#### `arcushub login <host>`
+#### `arcushub ssh <host>`
 
-SSH into a hub as root. Automatically tries known root passwords for hubOS 2.x, 3.x, and source builds. Supports legacy `ssh-rsa` host key algorithms for older firmware.
+SSH into a hub as root. Automatically tries known root passwords for hubOS 2.x, 3.x, and source builds. Supports legacy `ssh-rsa` host key algorithms for older firmware. Also available as `arcushub login`.
 
 ```sh
-arcushub login 10.105.1.200
-arcushub login LWR-2389
-arcushub login LWR-2389 --port 2222
+arcushub ssh 10.105.1.200
+arcushub ssh LWR-2389
+arcushub ssh LWR-2389 --port 2222
 ```
 
 #### `arcushub find <hub_id>`

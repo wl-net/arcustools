@@ -113,12 +113,12 @@ def _resolve_host(host: str, timeout: float = 5.0) -> str:
     raise click.ClickException(f"Hub {hub_id} not found on the network.")
 
 
-@cli.command()
+@cli.command("ssh")
 @click.argument("host")
 @click.option("--port", default=22, help="SSH port.")
 @click.option("--user", default="root", help="SSH username.")
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
-def login(host, port, user, password):
+def ssh(host, port, user, password):
     """SSH into an Arcus hub. HOST can be an IP address, hostname, or hub ID."""
     from .ssh import connect, interactive_shell
 
@@ -136,7 +136,7 @@ def login(host, port, user, password):
         client.close()
 
 
-cli.add_command(login, "ssh")
+cli.add_command(ssh, "login")
 
 
 @cli.command("debug-key")
