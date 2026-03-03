@@ -15,7 +15,8 @@ _CHAR_MOD = ALLOWED_SIZE ** 3  # 12167
 
 # Known OUIs for Arcus hubs (most common first)
 KNOWN_OUIS = [
-    0x0016A2,
+    0x0016A2,  # v2 hubs
+    0xA019B2,  # v3 hubs
 ]
 
 
