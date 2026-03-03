@@ -186,6 +186,50 @@ def enable_dropbear(host, port, user, password):
         client.close()
 
 
+@cli.command("setup-ssh-key")
+@click.argument("host")
+@click.option("--port", default=22, help="SSH port.")
+@click.option("--user", default="root", help="SSH username.")
+@click.option("--password", default=None, help="Override password (skip auto-detection).")
+@click.option("--key", type=click.Path(exists=True, path_type=Path), default=None, help="Path to SSH public key file (default: auto-detect).")
+def setup_ssh_key(host, port, user, password, key):
+    """Push an SSH public key to a hub for passwordless login. HOST can be an IP, hostname, or hub ID."""
+    from .ssh import connect
+
+    if key is None:
+        ssh_dir = Path.home() / ".ssh"
+        for name in ("id_ed25519.pub", "id_rsa.pub"):
+            candidate = ssh_dir / name
+            if candidate.exists():
+                key = candidate
+                break
+        if key is None:
+            raise click.ClickException(
+                "No SSH public key found. Generate one with ssh-keygen or specify --key."
+            )
+
+    key_content = key.read_text().strip()
+    click.echo(f"Using key: {key}")
+
+    host = _resolve_host(host)
+    click.echo(f"Connecting to {user}@{host}:{port}...")
+    try:
+        client = connect(host, port=port, user=user, password=password)
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+    try:
+        cmd = f"mkdir -p /data/config/dropbear && cat >> /data/config/dropbear/authorized_keys << 'SSHKEY'\n{key_content}\nSSHKEY"
+        _stdin, stdout, stderr = client.exec_command(cmd)
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status != 0:
+            err = stderr.read().decode().strip()
+            raise click.ClickException(f"Failed to install SSH key: {err}")
+        click.echo("SSH key installed. You can now connect without a password.")
+    finally:
+        client.close()
+
+
 @cli.command()
 @click.argument("hub_id")
 @click.option("--timeout", "-t", default=5.0, help="SSDP discovery timeout in seconds.")
@@ -242,6 +286,110 @@ def restart_agent(host, port, user, password):
         client.close()
 
 
+@cli.command("agent-reinstall")
+@click.argument("host")
+@click.option("--port", default=22, help="SSH port.")
+@click.option("--user", default="root", help="SSH username.")
+@click.option("--password", default=None, help="Override password (skip auto-detection).")
+def agent_reinstall(host, port, user, password):
+    """Reinstall the hub agent. Deletes /data/agent and reboots to re-extract from tarball.
+
+    Preserves pairing data in /data/iris. HOST can be an IP, hostname, or hub ID.
+    """
+    from .ssh import connect
+
+    host = _resolve_host(host)
+    click.echo(f"Connecting to {user}@{host}:{port}...")
+    try:
+        client = connect(host, port=port, user=user, password=password)
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+    try:
+        click.echo("Removing /data/agent and rebooting...")
+        client.exec_command("rm -rf /data/agent && reboot")
+        click.echo(f"Agent reinstall initiated on {host}.")
+    finally:
+        client.close()
+
+
+@cli.command("agent-reset")
+@click.argument("host")
+@click.option("--port", default=22, help="SSH port.")
+@click.option("--user", default="root", help="SSH username.")
+@click.option("--password", default=None, help="Override password (skip auto-detection).")
+def agent_reset(host, port, user, password):
+    """Factory reset the hub agent. Deletes /data/agent AND /data/iris, then reboots.
+
+    WARNING: This wipes all pairing data. HOST can be an IP, hostname, or hub ID.
+    """
+    from .ssh import connect
+
+    if not click.confirm("This will delete all agent data AND pairing data. Continue?"):
+        raise SystemExit(0)
+
+    host = _resolve_host(host)
+    click.echo(f"Connecting to {user}@{host}:{port}...")
+    try:
+        client = connect(host, port=port, user=user, password=password)
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+    try:
+        click.echo("Removing /data/agent and /data/iris, then rebooting...")
+        client.exec_command("rm -rf /data/agent /data/iris && reboot")
+        click.echo(f"Agent reset initiated on {host}.")
+    finally:
+        client.close()
+
+
+@cli.command("agent-install")
+@click.argument("host")
+@click.argument("tarfile", type=click.Path(exists=True, path_type=Path))
+@click.option("--port", default=22, help="SSH port.")
+@click.option("--user", default="root", help="SSH username.")
+@click.option("--password", default=None, help="Override password (skip auto-detection).")
+def agent_install(host, tarfile, port, user, password):
+    """Install a new agent tarball on a hub. Uploads the tarball, removes /data/agent, and reboots.
+
+    Preserves pairing data in /data/iris. HOST can be an IP, hostname, or hub ID.
+
+    \b
+    Examples:
+      arcushub agent-install LWR-2389 iris-agent-hub.tgz
+      arcushub agent-install 10.0.1.5 ./build/iris-agent-hub.tar.gz
+    """
+    from .ssh import connect
+
+    host = _resolve_host(host)
+    remote_path = "/home/agent/iris-agent-hub"
+
+    click.echo(f"Connecting to {user}@{host}:{port}...")
+    try:
+        client = connect(host, port=port, user=user, password=password)
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+    try:
+        click.echo(f"Uploading {tarfile} -> {remote_path}...")
+        chan = client.get_transport().open_session()
+        chan.exec_command(f"cat > {remote_path}")
+        with open(tarfile, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                chan.sendall(chunk)
+        chan.shutdown_write()
+        chan.recv_exit_status()
+
+        click.echo("Removing /data/agent and rebooting...")
+        client.exec_command("rm -rf /data/agent && reboot")
+        click.echo(f"Agent install initiated on {host}.")
+    finally:
+        client.close()
+
+
 @cli.command()
 @click.argument("src")
 @click.argument("dst")
@@ -287,14 +435,32 @@ def scp(src, dst, port, user, password):
         raise click.ClickException(str(e))
 
     try:
-        sftp = client.open_sftp()
         if src_host:
+            # Download: cat remote file to local
             click.echo(f"Downloading {src_path} -> {dst_path}")
-            sftp.get(src_path, dst_path)
+            chan = client.get_transport().open_session()
+            chan.exec_command(f"cat {src_path}")
+            with open(dst_path, "wb") as f:
+                while True:
+                    data = chan.recv(65536)
+                    if not data:
+                        break
+                    f.write(data)
+            if chan.recv_exit_status() != 0:
+                raise click.ClickException(f"Remote file not found: {src_path}")
         else:
+            # Upload: pipe local file into cat on remote
             click.echo(f"Uploading {src_path} -> {dst_path}")
-            sftp.put(src_path, dst_path)
-        sftp.close()
+            chan = client.get_transport().open_session()
+            chan.exec_command(f"cat > {dst_path}")
+            with open(src_path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    chan.sendall(chunk)
+            chan.shutdown_write()
+            chan.recv_exit_status()
         click.echo("Done.")
     finally:
         client.close()
@@ -329,11 +495,18 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, force):
         raise click.ClickException(str(e))
 
     try:
-        # Upload firmware
+        # Upload firmware via exec channel (hub SSH lacks SFTP)
         click.echo(f"Uploading {firmware.name} -> {remote_path}...")
-        sftp = client.open_sftp()
-        sftp.put(str(firmware), remote_path)
-        sftp.close()
+        chan = client.get_transport().open_session()
+        chan.exec_command(f"cat > {remote_path}")
+        with open(firmware, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                chan.sendall(chunk)
+        chan.shutdown_write()
+        chan.recv_exit_status()
 
         # Decide whether to use fwinstall (local file) or update (URL)
         # Since we uploaded the file, use fwinstall
@@ -359,7 +532,10 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, force):
         if exit_status != 0:
             err = stderr.decode().strip() if stderr else f"exit code {exit_status}"
             raise click.ClickException(f"Firmware install failed: {err}")
-        click.echo("Firmware install complete.")
+        click.echo("Firmware install complete. Rebooting...")
+        chan = client.get_transport().open_session()
+        chan.exec_command("reboot")
+        chan.recv_exit_status()
     finally:
         client.close()
 
