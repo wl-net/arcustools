@@ -97,6 +97,39 @@ Enable the dropbear SSH server to start by default on boot (creates `/data/confi
 arcushub enable-dropbear LWR-2389
 ```
 
+#### `arcushub setup-ssh-key <host>`
+
+Push your local SSH public key to a hub for passwordless login. Auto-detects `~/.ssh/id_ed25519.pub`, falling back to `~/.ssh/id_rsa.pub`.
+
+```sh
+arcushub setup-ssh-key LWR-2389
+arcushub setup-ssh-key LWR-2389 --key ~/.ssh/id_rsa.pub
+```
+
+#### `arcushub agent-reinstall <host>`
+
+Reinstall the hub agent by deleting `/data/agent` and rebooting. The agent tarball is re-extracted on boot. Pairing data in `/data/iris` is preserved.
+
+```sh
+arcushub agent-reinstall LWR-2389
+```
+
+#### `arcushub agent-reset <host>`
+
+Factory reset the hub agent. Deletes `/data/agent` **and** `/data/iris` (all pairing data), then reboots.
+
+```sh
+arcushub agent-reset LWR-2389
+```
+
+#### `arcushub agent-install <host> <tarfile>`
+
+Upload and install a new agent tarball on a hub. Removes `/data/agent` and reboots to extract the new tarball.
+
+```sh
+arcushub agent-install LWR-2389 iris-agent-hub.tgz
+```
+
 #### `arcushub scp <src> <dst>`
 
 Copy files to or from a hub using `HOST:PATH` syntax.
