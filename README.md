@@ -9,6 +9,12 @@ A command-line tool for managing Arcus hubs on a local network.
 ### Installation
 
 ```sh
+pipx install -e .
+```
+
+Or using a virtual environment:
+
+```sh
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -43,6 +49,15 @@ Find a hub's IP address on the local network by its hub ID.
 ```sh
 arcushub find LWR-2389
 arcushub find LWR-2389 --timeout 10
+```
+
+#### `arcushub ping <host>`
+
+Ping a hub and show basic status: ICMP latency, SSH port status, uptime, and agent process status.
+
+```sh
+arcushub ping LWR-2389
+arcushub ping 10.105.1.200
 ```
 
 #### `arcushub debug-key <hub_id>`
