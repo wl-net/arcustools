@@ -34,7 +34,7 @@ Hub IDs are derived from the hub's MAC address using a base-23 encoding scheme. 
 
 #### `arcushub ssh <host>`
 
-SSH into a hub as root. Automatically tries known root passwords for hubOS 2.x, 3.x, and source builds. Supports legacy `ssh-rsa` host key algorithms for older firmware. Also available as `arcushub login`.
+SSH into a hub as root. Automatically tries known root passwords for hubOS 2.x, 3.x, and source builds. Supports legacy `ssh-rsa` host key algorithms for older firmware.
 
 ```sh
 arcushub ssh 10.105.1.200

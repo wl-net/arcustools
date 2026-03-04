@@ -238,8 +238,6 @@ def ssh(host, port, user, password):
         client.close()
 
 
-cli.add_command(ssh, "login")
-
 
 @cli.command("debug-key")
 @click.argument("hub_id")
