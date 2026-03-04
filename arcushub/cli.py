@@ -51,8 +51,29 @@ def _is_reachable(ip: str, port: int = 22, timeout: float = 1.0) -> bool:
 def _find_in_arp(mac_even: str, mac_odd: str) -> str | None:
     """Search the ARP table for a MAC, return the IP or None."""
     import re
+
+    # Try /proc/net/arp first (Linux, no external dependency)
+    try:
+        with open("/proc/net/arp") as f:
+            for line in f.read().splitlines()[1:]:  # skip header
+                fields = line.split()
+                if len(fields) >= 4:
+                    ip_addr = fields[0]
+                    raw_mac = fields[3]
+                    if raw_mac == "00:00:00:00:00:00":
+                        continue
+                    norm = ":".join(f"{int(b, 16):02x}" for b in raw_mac.split(":"))
+                    if norm in (mac_even, mac_odd):
+                        return ip_addr
+    except OSError:
+        pass
+
+    # Fall back to arp command (macOS, BSDs)
     import subprocess
-    result = subprocess.run(["arp", "-a"], capture_output=True, text=True)
+    try:
+        result = subprocess.run(["arp", "-a"], capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
     for line in result.stdout.splitlines():
         arp_mac_match = re.search(r"at\s+([0-9a-f:]+)", line.lower())
         if not arp_mac_match:
