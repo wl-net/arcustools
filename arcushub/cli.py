@@ -48,6 +48,52 @@ def _is_reachable(ip: str, port: int = 22, timeout: float = 1.0) -> bool:
         return False
 
 
+def _find_all_hubs_in_arp() -> list[tuple[str, str]]:
+    """Scan ARP table for all MACs matching known Arcus OUIs. Returns [(ip, mac), ...]."""
+    from .hubid import KNOWN_OUIS
+
+    oui_prefixes = set()
+    for oui in KNOWN_OUIS:
+        oui_prefixes.add(f"{(oui >> 16) & 0xFF:02x}:{(oui >> 8) & 0xFF:02x}:{oui & 0xFF:02x}")
+
+    results = []
+
+    # Try /proc/net/arp first (Linux)
+    try:
+        with open("/proc/net/arp") as f:
+            for line in f.read().splitlines()[1:]:
+                fields = line.split()
+                if len(fields) >= 4:
+                    ip_addr = fields[0]
+                    raw_mac = fields[3]
+                    if raw_mac == "00:00:00:00:00:00":
+                        continue
+                    norm = ":".join(f"{int(b, 16):02x}" for b in raw_mac.split(":"))
+                    if norm[:8] in oui_prefixes:
+                        results.append((ip_addr, norm))
+        return results
+    except OSError:
+        pass
+
+    # Fall back to arp command (macOS, BSDs)
+    import re
+    import subprocess
+    try:
+        result = subprocess.run(["arp", "-a"], capture_output=True, text=True)
+    except FileNotFoundError:
+        return results
+    for line in result.stdout.splitlines():
+        arp_mac_match = re.search(r"at\s+([0-9a-f:]+)", line.lower())
+        if not arp_mac_match:
+            continue
+        arp_mac = ":".join(f"{int(b, 16):02x}" for b in arp_mac_match.group(1).split(":"))
+        if arp_mac[:8] in oui_prefixes:
+            m = re.search(r"\((\d+\.\d+\.\d+\.\d+)\)", line)
+            if m:
+                results.append((m.group(1), arp_mac))
+    return results
+
+
 def _find_in_arp(mac_even: str, mac_odd: str) -> str | None:
     """Search the ARP table for a MAC, return the IP or None."""
     import re
@@ -261,6 +307,49 @@ def find(hub_id, timeout):
     """Find a hub's IP address on the local network by its hub ID."""
     ip = _resolve_host(hub_id, timeout=timeout)
     click.echo(ip)
+
+
+@cli.command()
+@click.option("--timeout", "-t", default=5.0, help="SSDP discovery timeout in seconds.")
+def hubs(timeout):
+    """Discover all Arcus hubs on the local network."""
+    from .hubid import mac_to_hub_id
+    from .ssdp import discover
+
+    click.echo("Running SSDP discovery...")
+    discover(timeout=timeout)
+
+    found = _find_all_hubs_in_arp()
+    if not found:
+        click.echo("No hubs found.")
+        return
+
+    import subprocess
+
+    cache = _load_cache()
+    rows = []
+    for ip, mac in found:
+        hub_id = mac_to_hub_id(mac)
+        cache[hub_id] = ip
+        # Quick ICMP ping to check reachability
+        try:
+            result = subprocess.run(
+                ["ping", "-c", "1", "-W", "1", ip],
+                capture_output=True, timeout=3,
+            )
+            reachable = result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            reachable = False
+        rows.append((hub_id, ip, mac, reachable))
+    _save_cache(cache)
+
+    # Print table
+    id_w = max(len(r[0]) for r in rows)
+    ip_w = max(len(r[1]) for r in rows)
+    click.echo(f"{'HUB_ID':<{id_w}}  {'IP':<{ip_w}}  MAC")
+    for hub_id, ip, mac, reachable in rows:
+        note = "" if reachable else "  (unreachable)"
+        click.echo(f"{hub_id:<{id_w}}  {ip:<{ip_w}}  {mac}{note}")
 
 
 @cli.command()

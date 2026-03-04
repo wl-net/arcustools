@@ -51,6 +51,15 @@ arcushub find LWR-2389
 arcushub find LWR-2389 --timeout 10
 ```
 
+#### `arcushub hubs`
+
+Discover all Arcus hubs on the local network. Runs SSDP discovery to populate the ARP table, then scans for MACs matching known Arcus OUIs and displays each hub's ID, IP, and MAC address.
+
+```sh
+arcushub hubs
+arcushub hubs --timeout 10
+```
+
 #### `arcushub ping <host>`
 
 Ping a hub and show basic status: ICMP latency, SSH port status, uptime, and agent process status.
