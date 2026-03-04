@@ -1,7 +1,36 @@
 import sys
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import click
+
+
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+@contextmanager
+def _spinner(message: str):
+    """Show a braille spinner with a message while work runs in the block."""
+    stop = threading.Event()
+
+    def spin():
+        i = 0
+        while not stop.is_set():
+            frame = _SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]
+            click.echo(f"\r\033[K{frame} {message}", nl=False)
+            i += 1
+            stop.wait(0.08)
+        click.echo(f"\r\033[K✔ {message}")
+
+    t = threading.Thread(target=spin, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join()
 
 # Default data directory: the hub/ dir in the repo root (sibling of arcushub/)
 _PACKAGE_DIR = Path(__file__).resolve().parent
@@ -316,8 +345,8 @@ def hubs(timeout):
     from .hubid import mac_to_hub_id
     from .ssdp import discover
 
-    click.echo("Running SSDP discovery...")
-    discover(timeout=timeout)
+    with _spinner("Running SSDP discovery"):
+        discover(timeout=timeout)
 
     found = _find_all_hubs_in_arp()
     if not found:
@@ -328,19 +357,19 @@ def hubs(timeout):
 
     cache = _load_cache()
     rows = []
-    for ip, mac in found:
-        hub_id = mac_to_hub_id(mac)
-        cache[hub_id] = ip
-        # Quick ICMP ping to check reachability
-        try:
-            result = subprocess.run(
-                ["ping", "-c", "1", "-W", "1", ip],
-                capture_output=True, timeout=3,
-            )
-            reachable = result.returncode == 0
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            reachable = False
-        rows.append((hub_id, ip, mac, reachable))
+    with _spinner(f"Pinging {len(found)} hub{'s' if len(found) != 1 else ''}"):
+        for ip, mac in found:
+            hub_id = mac_to_hub_id(mac)
+            cache[hub_id] = ip
+            try:
+                result = subprocess.run(
+                    ["ping", "-c", "1", "-W", "1", ip],
+                    capture_output=True, timeout=3,
+                )
+                reachable = result.returncode == 0
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                reachable = False
+            rows.append((hub_id, ip, mac, reachable))
     _save_cache(cache)
 
     # Print table
