@@ -161,6 +161,15 @@ def _find_in_arp(mac_even: str, mac_odd: str) -> str | None:
     return None
 
 
+def _connect(host: str, port: int = 22, user: str = "root", password: str | None = None):
+    """Connect to a hub via SSH, showing a spinner during the handshake."""
+    from .ssh import connect
+
+    with _spinner(f"Connecting to {user}@{host}:{port}"):
+        client = connect(host, port=port, user=user, password=password)
+    return client
+
+
 def _resolve_host(host: str, timeout: float = 5.0) -> str:
     """If host is a hub ID, find its IP on the network. Otherwise return as-is.
 
@@ -197,8 +206,8 @@ def _resolve_host(host: str, timeout: float = 5.0) -> str:
         return ip
 
     # 3. SSDP discovery to populate ARP table, then check again
-    click.echo("Running SSDP discovery...")
-    discover(timeout=timeout)
+    with _spinner("Running SSDP discovery"):
+        discover(timeout=timeout)
 
     ip = _find_in_arp(mac_even, mac_odd)
     if ip:
@@ -216,16 +225,13 @@ def _resolve_host(host: str, timeout: float = 5.0) -> str:
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
 def ssh(host, port, user, password):
     """SSH into an Arcus hub. HOST can be an IP address, hostname, or hub ID."""
-    from .ssh import connect, interactive_shell
+    from .ssh import interactive_shell
 
     host = _resolve_host(host)
-    click.echo(f"Connecting to {user}@{host}:{port}...")
     try:
-        client = connect(host, port=port, user=user, password=password)
+        client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
         raise click.ClickException(str(e))
-
-    click.echo("Connected.")
     try:
         interactive_shell(client)
     finally:
@@ -265,12 +271,9 @@ def debug_key(hub_id, data_dir, output):
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
 def enable_dropbear(host, port, user, password):
     """Enable dropbear SSH server on a hub by default. HOST can be an IP, hostname, or hub ID."""
-    from .ssh import connect
-
     host = _resolve_host(host)
-    click.echo(f"Connecting to {user}@{host}:{port}...")
     try:
-        client = connect(host, port=port, user=user, password=password)
+        client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -293,8 +296,6 @@ def enable_dropbear(host, port, user, password):
 @click.option("--key", type=click.Path(exists=True, path_type=Path), default=None, help="Path to SSH public key file (default: auto-detect).")
 def setup_ssh_key(host, port, user, password, key):
     """Push an SSH public key to a hub for passwordless login. HOST can be an IP, hostname, or hub ID."""
-    from .ssh import connect
-
     if key is None:
         ssh_dir = Path.home() / ".ssh"
         for name in ("id_ed25519.pub", "id_rsa.pub"):
@@ -311,9 +312,8 @@ def setup_ssh_key(host, port, user, password, key):
     click.echo(f"Using key: {key}")
 
     host = _resolve_host(host)
-    click.echo(f"Connecting to {user}@{host}:{port}...")
     try:
-        client = connect(host, port=port, user=user, password=password)
+        client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -389,7 +389,6 @@ def hubs(timeout):
 def ping(host, port, user, password):
     """Ping a hub and show basic status. HOST can be an IP, hostname, or hub ID."""
     import subprocess
-    from .ssh import connect
 
     host = _resolve_host(host)
 
@@ -422,7 +421,7 @@ def ping(host, port, user, password):
 
     # Grab uptime and agent status via SSH
     try:
-        client = connect(host, port=port, user=user, password=password)
+        client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
         click.echo(f"  SSH login failed: {e}")
         return
@@ -447,12 +446,9 @@ def ping(host, port, user, password):
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
 def reboot(host, port, user, password):
     """Reboot a hub. HOST can be an IP address, hostname, or hub ID."""
-    from .ssh import connect
-
     host = _resolve_host(host)
-    click.echo(f"Connecting to {user}@{host}:{port}...")
     try:
-        client = connect(host, port=port, user=user, password=password)
+        client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -470,12 +466,9 @@ def reboot(host, port, user, password):
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
 def restart_agent(host, port, user, password):
     """Restart the hub agent. HOST can be an IP address, hostname, or hub ID."""
-    from .ssh import connect
-
     host = _resolve_host(host)
-    click.echo(f"Connecting to {user}@{host}:{port}...")
     try:
-        client = connect(host, port=port, user=user, password=password)
+        client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -497,12 +490,9 @@ def agent_reinstall(host, port, user, password):
 
     Preserves pairing data in /data/iris. HOST can be an IP, hostname, or hub ID.
     """
-    from .ssh import connect
-
     host = _resolve_host(host)
-    click.echo(f"Connecting to {user}@{host}:{port}...")
     try:
-        client = connect(host, port=port, user=user, password=password)
+        client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -524,15 +514,12 @@ def agent_reset(host, port, user, password):
 
     WARNING: This wipes all pairing data. HOST can be an IP, hostname, or hub ID.
     """
-    from .ssh import connect
-
     if not click.confirm("This will delete all agent data AND pairing data. Continue?"):
         raise SystemExit(0)
 
     host = _resolve_host(host)
-    click.echo(f"Connecting to {user}@{host}:{port}...")
     try:
-        client = connect(host, port=port, user=user, password=password)
+        client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -560,29 +547,26 @@ def agent_install(host, tarfile, port, user, password):
       arcushub agent-install LWR-2389 iris-agent-hub.tgz
       arcushub agent-install 10.0.1.5 ./build/iris-agent-hub.tar.gz
     """
-    from .ssh import connect
-
     host = _resolve_host(host)
     remote_path = "/home/agent/iris-agent-hub"
 
-    click.echo(f"Connecting to {user}@{host}:{port}...")
     try:
-        client = connect(host, port=port, user=user, password=password)
+        client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
         raise click.ClickException(str(e))
 
     try:
-        click.echo(f"Uploading {tarfile} -> {remote_path}...")
-        chan = client.get_transport().open_session()
-        chan.exec_command(f"cat > {remote_path}")
-        with open(tarfile, "rb") as f:
-            while True:
-                chunk = f.read(65536)
-                if not chunk:
-                    break
-                chan.sendall(chunk)
-        chan.shutdown_write()
-        chan.recv_exit_status()
+        with _spinner(f"Uploading {tarfile} → {remote_path}"):
+            chan = client.get_transport().open_session()
+            chan.exec_command(f"cat > {remote_path}")
+            with open(tarfile, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    chan.sendall(chunk)
+            chan.shutdown_write()
+            chan.recv_exit_status()
 
         click.echo("Removing /data/agent and rebooting...")
         client.exec_command("rm -rf /data/agent && reboot")
@@ -607,8 +591,6 @@ def scp(src, dst, port, user, password):
       arcushub scp firmware.bin LWR-2389:/tmp/
       arcushub scp 10.0.1.5:/var/log/messages ./messages
     """
-    from .ssh import connect
-
     def parse_remote(path):
         """Split HOST:PATH, returns (host, remote_path) or (None, local_path)."""
         # Avoid splitting on Windows drive letters (C:\) or bare paths
@@ -629,40 +611,38 @@ def scp(src, dst, port, user, password):
     remote_host = src_host or dst_host
     remote_host = _resolve_host(remote_host)
 
-    click.echo(f"Connecting to {user}@{remote_host}:{port}...")
     try:
-        client = connect(remote_host, port=port, user=user, password=password)
+        client = _connect(remote_host, port=port, user=user, password=password)
     except Exception as e:
         raise click.ClickException(str(e))
 
     try:
         if src_host:
             # Download: cat remote file to local
-            click.echo(f"Downloading {src_path} -> {dst_path}")
-            chan = client.get_transport().open_session()
-            chan.exec_command(f"cat {src_path}")
-            with open(dst_path, "wb") as f:
-                while True:
-                    data = chan.recv(65536)
-                    if not data:
-                        break
-                    f.write(data)
-            if chan.recv_exit_status() != 0:
-                raise click.ClickException(f"Remote file not found: {src_path}")
+            with _spinner(f"Downloading {src_path} → {dst_path}"):
+                chan = client.get_transport().open_session()
+                chan.exec_command(f"cat {src_path}")
+                with open(dst_path, "wb") as f:
+                    while True:
+                        data = chan.recv(65536)
+                        if not data:
+                            break
+                        f.write(data)
+                if chan.recv_exit_status() != 0:
+                    raise click.ClickException(f"Remote file not found: {src_path}")
         else:
             # Upload: pipe local file into cat on remote
-            click.echo(f"Uploading {src_path} -> {dst_path}")
-            chan = client.get_transport().open_session()
-            chan.exec_command(f"cat > {dst_path}")
-            with open(src_path, "rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    chan.sendall(chunk)
-            chan.shutdown_write()
-            chan.recv_exit_status()
-        click.echo("Done.")
+            with _spinner(f"Uploading {src_path} → {dst_path}"):
+                chan = client.get_transport().open_session()
+                chan.exec_command(f"cat > {dst_path}")
+                with open(src_path, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        chan.sendall(chunk)
+                chan.shutdown_write()
+                chan.recv_exit_status()
     finally:
         client.close()
 
@@ -684,32 +664,28 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, force):
       arcushub flash LWR-2389 hub/v2/firmware/hubOS_2.2.0.009.bin
       arcushub flash 10.0.1.5 hub/v3/firmware/hubOSv3_3.0.1.025.bin
     """
-    from .ssh import connect
-
     host = _resolve_host(host)
     remote_path = f"/tmp/{firmware.name}"
 
-    click.echo(f"Connecting to {user}@{host}:{port}...")
     try:
-        client = connect(host, port=port, user=user, password=password)
+        client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
         raise click.ClickException(str(e))
 
     try:
         # Upload firmware via exec channel (hub SSH lacks SFTP)
-        click.echo(f"Uploading {firmware.name} -> {remote_path}...")
-        chan = client.get_transport().open_session()
-        chan.exec_command(f"cat > {remote_path}")
-        with open(firmware, "rb") as f:
-            while True:
-                chunk = f.read(65536)
-                if not chunk:
-                    break
-                chan.sendall(chunk)
-        chan.shutdown_write()
-        chan.recv_exit_status()
+        with _spinner(f"Uploading {firmware.name} → {remote_path}"):
+            chan = client.get_transport().open_session()
+            chan.exec_command(f"cat > {remote_path}")
+            with open(firmware, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    chan.sendall(chunk)
+            chan.shutdown_write()
+            chan.recv_exit_status()
 
-        # Decide whether to use fwinstall (local file) or update (URL)
         # Since we uploaded the file, use fwinstall
         cmd_parts = ["fwinstall"]
         if kill_agent:
@@ -749,12 +725,9 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, force):
 @click.option("-n", "--lines", default=50, help="Number of existing lines to show.")
 def logs(host, port, user, password, lines):
     """Tail /tmp/hubAgent.log on a hub. HOST can be an IP, hostname, or hub ID."""
-    from .ssh import connect
-
     host = _resolve_host(host)
-    click.echo(f"Connecting to {user}@{host}:{port}...")
     try:
-        client = connect(host, port=port, user=user, password=password)
+        client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
         raise click.ClickException(str(e))
 
