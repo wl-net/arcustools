@@ -55,6 +55,9 @@ def interactive_shell(client: paramiko.SSHClient) -> None:
         tty.setcbreak(sys.stdin.fileno())
         chan.settimeout(0.0)
 
+        after_newline = True  # start of session counts as after newline
+        escape_seen = False
+
         while True:
             r, _w, _e = select.select([chan, sys.stdin], [], [])
             if chan in r:
@@ -70,7 +73,33 @@ def interactive_shell(client: paramiko.SSHClient) -> None:
                 data = os.read(sys.stdin.fileno(), 1024)
                 if not data:
                     break
-                chan.send(data)
+                # Process escape sequences byte-by-byte (like OpenSSH ~.)
+                out = bytearray()
+                for byte in data:
+                    if escape_seen:
+                        escape_seen = False
+                        if byte == ord("."):
+                            sys.stdout.buffer.write(b"\r\nConnection closed.\r\n")
+                            sys.stdout.buffer.flush()
+                            return
+                        elif byte == ord("~"):
+                            # ~~ sends a literal ~
+                            out.append(byte)
+                            after_newline = False
+                            continue
+                        else:
+                            # Not a recognized escape; send the ~ we swallowed
+                            out.append(ord("~"))
+                            out.append(byte)
+                            after_newline = (byte in (0x0a, 0x0d))
+                            continue
+                    if after_newline and byte == ord("~"):
+                        escape_seen = True
+                        continue
+                    after_newline = (byte in (0x0a, 0x0d))
+                    out.append(byte)
+                if out:
+                    chan.send(bytes(out))
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, oldtty)
         chan.close()

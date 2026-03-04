@@ -268,6 +268,65 @@ def find(hub_id, timeout):
 @click.option("--port", default=22, help="SSH port.")
 @click.option("--user", default="root", help="SSH username.")
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
+def ping(host, port, user, password):
+    """Ping a hub and show basic status. HOST can be an IP, hostname, or hub ID."""
+    import subprocess
+    from .ssh import connect
+
+    host = _resolve_host(host)
+
+    # ICMP ping
+    click.echo(f"Pinging {host}...")
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "3", host],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            # Extract summary line (e.g. "rtt min/avg/max/mdev = ...")
+            for line in result.stdout.splitlines():
+                if "min/avg/max" in line or "round-trip" in line:
+                    click.echo(f"  Latency: {line.strip()}")
+                    break
+            else:
+                click.echo("  Ping: OK")
+        else:
+            click.echo("  Ping: FAILED (no response)")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        click.echo("  Ping: FAILED (timeout or ping not available)")
+
+    # SSH port check
+    ssh_up = _is_reachable(host, port=port)
+    click.echo(f"  SSH (port {port}): {'UP' if ssh_up else 'DOWN'}")
+
+    if not ssh_up:
+        return
+
+    # Grab uptime and agent status via SSH
+    try:
+        client = connect(host, port=port, user=user, password=password)
+    except Exception as e:
+        click.echo(f"  SSH login failed: {e}")
+        return
+
+    try:
+        _stdin, stdout, _stderr = client.exec_command("uptime")
+        uptime = stdout.read().decode().strip()
+        if uptime:
+            click.echo(f"  Uptime: {uptime}")
+
+        _stdin, stdout, _stderr = client.exec_command("pgrep -f hubAgent")
+        agent_pid = stdout.read().decode().strip()
+        click.echo(f"  Hub agent: {'running (pid ' + agent_pid.splitlines()[0] + ')' if agent_pid else 'not running'}")
+    finally:
+        client.close()
+
+
+@cli.command()
+@click.argument("host")
+@click.option("--port", default=22, help="SSH port.")
+@click.option("--user", default="root", help="SSH username.")
+@click.option("--password", default=None, help="Override password (skip auto-detection).")
 def reboot(host, port, user, password):
     """Reboot a hub. HOST can be an IP address, hostname, or hub ID."""
     from .ssh import connect
