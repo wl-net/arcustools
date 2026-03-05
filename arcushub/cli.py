@@ -10,8 +10,35 @@ import click
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
+def _format_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+class _Progress:
+    """Thread-safe byte counter for transfer progress."""
+    def __init__(self, total: int | None = None):
+        self.transferred = 0
+        self.total = total
+        self._lock = threading.Lock()
+
+    def update(self, n: int):
+        with self._lock:
+            self.transferred += n
+
+    def status(self) -> str:
+        with self._lock:
+            if self.total:
+                pct = self.transferred / self.total * 100
+                return f"{_format_size(self.transferred)}/{_format_size(self.total)} ({pct:.0f}%)"
+            return _format_size(self.transferred)
+
+
 @contextmanager
-def _spinner(message: str):
+def _spinner(message: str, progress: _Progress | None = None):
     """Show a braille spinner with a message while work runs in the block."""
     stop = threading.Event()
 
@@ -19,10 +46,12 @@ def _spinner(message: str):
         i = 0
         while not stop.is_set():
             frame = _SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]
-            click.echo(f"\r\033[K{frame} {message}", nl=False)
+            suffix = f"  {progress.status()}" if progress else ""
+            click.echo(f"\r\033[K{frame} {message}{suffix}", nl=False)
             i += 1
             stop.wait(0.08)
-        click.echo(f"\r\033[K✔ {message}")
+        suffix = f"  {progress.status()}" if progress else ""
+        click.echo(f"\r\033[K✔ {message}{suffix}")
 
     t = threading.Thread(target=spin, daemon=True)
     t.start()
@@ -554,7 +583,8 @@ def agent_install(host, tarfile, port, user, password):
         raise click.ClickException(str(e))
 
     try:
-        with _spinner(f"Uploading {tarfile} → {remote_path}"):
+        prog = _Progress(total=Path(tarfile).stat().st_size)
+        with _spinner(f"Uploading {tarfile} → {remote_path}", progress=prog):
             chan = client.get_transport().open_session()
             chan.exec_command(f"cat > {remote_path}")
             with open(tarfile, "rb") as f:
@@ -563,6 +593,7 @@ def agent_install(host, tarfile, port, user, password):
                     if not chunk:
                         break
                     chan.sendall(chunk)
+                    prog.update(len(chunk))
             chan.shutdown_write()
             chan.recv_exit_status()
 
@@ -617,7 +648,8 @@ def scp(src, dst, port, user, password):
     try:
         if src_host:
             # Download: cat remote file to local
-            with _spinner(f"Downloading {src_path} → {dst_path}"):
+            prog = _Progress()
+            with _spinner(f"Downloading {src_path} → {dst_path}", progress=prog):
                 chan = client.get_transport().open_session()
                 chan.exec_command(f"cat {src_path}")
                 with open(dst_path, "wb") as f:
@@ -626,11 +658,21 @@ def scp(src, dst, port, user, password):
                         if not data:
                             break
                         f.write(data)
+                        prog.update(len(data))
                 if chan.recv_exit_status() != 0:
                     raise click.ClickException(f"Remote file not found: {src_path}")
         else:
             # Upload: pipe local file into cat on remote
-            with _spinner(f"Uploading {src_path} → {dst_path}"):
+            # Verify remote directory exists before transferring
+            remote_dir = dst_path.rsplit("/", 1)[0] if "/" in dst_path else "."
+            chan = client.get_transport().open_session()
+            chan.exec_command(f"test -d {remote_dir}")
+            if chan.recv_exit_status() != 0:
+                raise click.ClickException(f"Remote directory does not exist: {remote_dir}")
+
+            total = Path(src_path).stat().st_size
+            prog = _Progress(total=total)
+            with _spinner(f"Uploading {src_path} → {dst_path}", progress=prog):
                 chan = client.get_transport().open_session()
                 chan.exec_command(f"cat > {dst_path}")
                 with open(src_path, "rb") as f:
@@ -639,6 +681,7 @@ def scp(src, dst, port, user, password):
                         if not chunk:
                             break
                         chan.sendall(chunk)
+                        prog.update(len(chunk))
                 chan.shutdown_write()
                 chan.recv_exit_status()
     finally:
@@ -672,7 +715,8 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, force):
 
     try:
         # Upload firmware via exec channel (hub SSH lacks SFTP)
-        with _spinner(f"Uploading {firmware.name} → {remote_path}"):
+        prog = _Progress(total=firmware.stat().st_size)
+        with _spinner(f"Uploading {firmware.name} → {remote_path}", progress=prog):
             chan = client.get_transport().open_session()
             chan.exec_command(f"cat > {remote_path}")
             with open(firmware, "rb") as f:
@@ -681,6 +725,7 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, force):
                     if not chunk:
                         break
                     chan.sendall(chunk)
+                    prog.update(len(chunk))
             chan.shutdown_write()
             chan.recv_exit_status()
 
