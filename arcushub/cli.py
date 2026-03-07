@@ -249,11 +249,21 @@ def _resolve_host(host: str, timeout: float = 5.0) -> str:
 
 @cli.command("ssh")
 @click.argument("host")
+@click.argument("command", nargs=-1)
 @click.option("--port", default=22, help="SSH port.")
 @click.option("--user", default="root", help="SSH username.")
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
-def ssh(host, port, user, password):
-    """SSH into an Arcus hub. HOST can be an IP address, hostname, or hub ID."""
+def ssh(host, command, port, user, password):
+    """SSH into an Arcus hub. HOST can be an IP address, hostname, or hub ID.
+
+    If COMMAND is given, run it on the hub and exit. Otherwise open an interactive shell.
+
+    \b
+    Examples:
+      arcushub ssh LWR-2389
+      arcushub ssh LWR-2389 killall java
+      arcushub ssh 10.0.1.5 cat /tmp/hubAgent.log
+    """
     from .ssh import interactive_shell
 
     host = _resolve_host(host)
@@ -262,7 +272,22 @@ def ssh(host, port, user, password):
     except Exception as e:
         raise click.ClickException(str(e))
     try:
-        interactive_shell(client)
+        if command:
+            chan = client.get_transport().open_session()
+            chan.exec_command(" ".join(command))
+            while True:
+                data = chan.recv(4096)
+                if not data:
+                    break
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+            stderr = chan.recv_stderr(4096)
+            if stderr:
+                sys.stderr.buffer.write(stderr)
+                sys.stderr.buffer.flush()
+            sys.exit(chan.recv_exit_status())
+        else:
+            interactive_shell(client)
     finally:
         client.close()
 
@@ -582,11 +607,13 @@ def agent_install(host, tarfile, port, user, password):
     except Exception as e:
         raise click.ClickException(str(e))
 
+    tmp_path = "/tmp/iris-agent-hub"
+
     try:
         prog = _Progress(total=Path(tarfile).stat().st_size)
-        with _spinner(f"Uploading {tarfile} → {remote_path}", progress=prog):
+        with _spinner(f"Uploading {tarfile} → {tmp_path}", progress=prog):
             chan = client.get_transport().open_session()
-            chan.exec_command(f"cat > {remote_path}")
+            chan.exec_command(f"cat > {tmp_path}")
             with open(tarfile, "rb") as f:
                 while True:
                     chunk = f.read(65536)
@@ -597,9 +624,66 @@ def agent_install(host, tarfile, port, user, password):
             chan.shutdown_write()
             chan.recv_exit_status()
 
-        click.echo("Removing /data/agent and rebooting...")
-        client.exec_command("rm -rf /data/agent && reboot")
+        click.echo("Installing agent and rebooting...")
+        client.exec_command(f"agent_install {tmp_path}")
         click.echo(f"Agent install initiated on {host}.")
+    finally:
+        client.close()
+
+
+@cli.command("agent-test")
+@click.argument("host")
+@click.argument("tarfile", type=click.Path(exists=True, path_type=Path))
+@click.option("--port", default=22, help="SSH port.")
+@click.option("--user", default="root", help="SSH username.")
+@click.option("--password", default=None, help="Override password (skip auto-detection).")
+def agent_test(host, tarfile, port, user, password):
+    """Upload and hot-swap an agent tarball without rebooting.
+
+    Stops the agent, extracts the new tarball over /data/agent, and restarts it.
+    Useful for rapid iteration during development.
+
+    \b
+    Examples:
+      arcushub agent-test LWR-2389 iris-agent-hub.tgz
+      arcushub agent-test 10.0.1.5 ./build/iris-agent-hub.tar.gz
+    """
+    host = _resolve_host(host)
+    tmp_path = "/tmp/iris-agent-hub"
+
+    try:
+        client = _connect(host, port=port, user=user, password=password)
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+    try:
+        prog = _Progress(total=Path(tarfile).stat().st_size)
+        with _spinner(f"Uploading {tarfile} → {tmp_path}", progress=prog):
+            chan = client.get_transport().open_session()
+            chan.exec_command(f"cat > {tmp_path}")
+            with open(tarfile, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    chan.sendall(chunk)
+                    prog.update(len(chunk))
+            chan.shutdown_write()
+            chan.recv_exit_status()
+
+        click.echo("Stopping agent, extracting, and restarting...")
+        install_cmd = (
+            "killall java; "
+            "cd /data/agent && "
+            "rm -rf lib bin conf libs && rm -f * && "
+            f"tar xf {tmp_path} && "
+            "chown -R agent . && chgrp -R agent . && "
+            "agent_start"
+        )
+        chan = client.get_transport().open_session()
+        chan.exec_command(install_cmd)
+        chan.recv_exit_status()
+        click.echo(f"Agent restarted on {host}.")
     finally:
         client.close()
 
@@ -765,9 +849,22 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, force):
 @click.option("--port", default=22, help="SSH port.")
 @click.option("--user", default="root", help="SSH username.")
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
-@click.option("-n", "--lines", default=50, help="Number of existing lines to show.")
-def logs(host, port, user, password, lines):
-    """Tail /tmp/hubAgent.log on a hub. HOST can be an IP, hostname, or hub ID."""
+@click.option("-f", "--follow", is_flag=True, help="Follow the log in real time (like tail -f).")
+@click.option("-n", "--lines", default=50, help="Number of lines to show when following.")
+@click.option("-o", "--output", type=click.Path(path_type=Path), default=None, help="Save log to this file (default: hubAgent.log).")
+def logs(host, port, user, password, follow, lines, output):
+    """Download or follow /tmp/hubAgent.log on a hub. HOST can be an IP, hostname, or hub ID.
+
+    By default, downloads the full log file. Use -f to follow in real time.
+
+    \b
+    Examples:
+      arcushub logs LWR-2389              # download full log
+      arcushub logs LWR-2389 -o hub.log   # download to specific file
+      arcushub logs LWR-2389 -f           # follow log in real time
+      arcushub logs LWR-2389 -f -n 100    # follow, showing last 100 lines
+    """
+    remote_path = "/tmp/hubAgent.log"
     host = _resolve_host(host)
     try:
         client = _connect(host, port=port, user=user, password=password)
@@ -775,16 +872,32 @@ def logs(host, port, user, password, lines):
         raise click.ClickException(str(e))
 
     try:
-        chan = client.get_transport().open_session()
-        chan.exec_command(f"tail -n {lines} -f /tmp/hubAgent.log")
-        try:
-            while True:
-                data = chan.recv(4096)
-                if not data:
-                    break
-                sys.stdout.buffer.write(data)
-                sys.stdout.buffer.flush()
-        except KeyboardInterrupt:
-            pass
+        if follow:
+            chan = client.get_transport().open_session()
+            chan.exec_command(f"tail -n {lines} -f {remote_path}")
+            try:
+                while True:
+                    data = chan.recv(4096)
+                    if not data:
+                        break
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.buffer.flush()
+            except KeyboardInterrupt:
+                pass
+        else:
+            local_path = output or Path("hubAgent.log")
+            prog = _Progress()
+            with _spinner(f"Downloading {remote_path} → {local_path}", progress=prog):
+                chan = client.get_transport().open_session()
+                chan.exec_command(f"cat {remote_path}")
+                with open(local_path, "wb") as f:
+                    while True:
+                        data = chan.recv(65536)
+                        if not data:
+                            break
+                        f.write(data)
+                        prog.update(len(data))
+                if chan.recv_exit_status() != 0:
+                    raise click.ClickException(f"Failed to read {remote_path}")
     finally:
         client.close()
