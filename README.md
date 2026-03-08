@@ -32,14 +32,14 @@ Hub IDs are derived from the hub's MAC address using a base-23 encoding scheme. 
 
 ### Commands
 
-#### `arcushub ssh <host>`
+#### `arcushub ssh <host> [command...]`
 
-SSH into a hub as root. Automatically tries known root passwords for hubOS 2.x, 3.x, and source builds. Supports legacy `ssh-rsa` host key algorithms for older firmware.
+SSH into a hub as root. Automatically tries known root passwords for hubOS 2.x, 3.x, and source builds. If a command is given, runs it on the hub and exits. Otherwise opens an interactive shell.
 
 ```sh
-arcushub ssh 10.105.1.200
 arcushub ssh LWR-2389
-arcushub ssh LWR-2389 --port 2222
+arcushub ssh LWR-2389 killall java
+arcushub ssh LWR-2389 cat /tmp/hubAgent.log
 ```
 
 #### `arcushub find <hub_id>`
@@ -69,32 +69,26 @@ arcushub ping LWR-2389
 arcushub ping 10.105.1.200
 ```
 
-#### `arcushub debug-key <hub_id>`
-
-Extract the `.dbg` debug key file for a hub from the local ZIP archives in `hub/`.
-
-```sh
-arcushub debug-key LWC-8045                    # outputs LWC-8045.dbg to current dir
-arcushub debug-key LWC-8045 -o /tmp/key.dbg    # custom output path
-```
-
 #### `arcushub logs <host>`
 
-Tail `/tmp/hubAgent.log` on a hub. Press Ctrl-C to stop.
+Download or follow `/tmp/hubAgent.log` on a hub. By default, downloads the full log file. Use `-f` to follow in real time.
 
 ```sh
-arcushub logs LWR-2389
-arcushub logs 10.105.1.200 -n 100    # show last 100 lines
+arcushub logs LWR-2389              # download full log
+arcushub logs LWR-2389 -o hub.log   # download to specific file
+arcushub logs LWR-2389 -f           # follow log in real time
+arcushub logs LWR-2389 -f -n 100    # follow, showing last 100 lines
 ```
 
 #### `arcushub flash <host> <firmware>`
 
-Upload a firmware binary to a hub and install it using `fwinstall`.
+Upload and install firmware on a hub. Automatically detects signed firmware (uses `update`) vs unsigned archives (uses `fwinstall`).
 
 ```sh
 arcushub flash LWR-2389 hub/v2/firmware/hubOS_2.2.0.009.bin
 arcushub flash LWR-2389 hub/v3/firmware/hubOSv3_3.0.1.025.bin -k    # kill agent first
 arcushub flash LWR-2389 firmware.bin -s                               # skip radio firmware
+arcushub flash LWR-2389 firmware.bin -f                               # force install
 ```
 
 #### `arcushub reboot <host>`
@@ -105,12 +99,22 @@ Reboot a hub.
 arcushub reboot LWR-2389
 ```
 
-#### `arcushub restart-agent <host>`
+#### `arcushub scp <src> <dst>`
 
-Restart the hub agent (runs `agent_stop` then `agent_start`).
+Copy files to or from a hub over SSH using `HOST:PATH` syntax.
 
 ```sh
-arcushub restart-agent LWR-2389
+arcushub scp firmware.bin LWR-2389:/tmp/
+arcushub scp LWR-2389:/var/log/messages ./messages
+```
+
+#### `arcushub debug-key <hub_id>`
+
+Extract the `.dbg` debug key file for a hub from the local ZIP archives in `hub/`.
+
+```sh
+arcushub debug-key LWC-8045                    # outputs LWC-8045.dbg to current dir
+arcushub debug-key LWC-8045 -o /tmp/key.dbg    # custom output path
 ```
 
 #### `arcushub enable-dropbear <host>`
@@ -130,37 +134,48 @@ arcushub setup-ssh-key LWR-2389
 arcushub setup-ssh-key LWR-2389 --key ~/.ssh/id_rsa.pub
 ```
 
-#### `arcushub agent-reinstall <host>`
+### Agent commands
+
+Agent lifecycle commands are grouped under `arcushub agent`.
+
+#### `arcushub agent restart <host>`
+
+Restart the hub agent (runs `agent_stop` then `agent_start`).
+
+```sh
+arcushub agent restart LWR-2389
+```
+
+#### `arcushub agent install <host> <tarfile>`
+
+Upload and install a new agent tarball on a hub. Removes `/data/agent` and reboots to extract the new tarball. Preserves pairing data in `/data/iris`.
+
+```sh
+arcushub agent install LWR-2389 iris-agent-hub.tgz
+```
+
+#### `arcushub agent test <host> <tarfile>`
+
+Hot-swap an agent tarball without rebooting. Stops the agent, extracts the new tarball over `/data/agent`, and restarts it. Useful for rapid iteration during development.
+
+```sh
+arcushub agent test LWR-2389 iris-agent-hub.tgz
+```
+
+#### `arcushub agent reinstall <host>`
 
 Reinstall the hub agent by deleting `/data/agent` and rebooting. The agent tarball is re-extracted on boot. Pairing data in `/data/iris` is preserved.
 
 ```sh
-arcushub agent-reinstall LWR-2389
+arcushub agent reinstall LWR-2389
 ```
 
-#### `arcushub agent-reset <host>`
+#### `arcushub agent reset <host>`
 
 Factory reset the hub agent. Deletes `/data/agent` **and** `/data/iris` (all pairing data), then reboots.
 
 ```sh
-arcushub agent-reset LWR-2389
-```
-
-#### `arcushub agent-install <host> <tarfile>`
-
-Upload and install a new agent tarball on a hub. Removes `/data/agent` and reboots to extract the new tarball.
-
-```sh
-arcushub agent-install LWR-2389 iris-agent-hub.tgz
-```
-
-#### `arcushub scp <src> <dst>`
-
-Copy files to or from a hub over SSH using `HOST:PATH` syntax.
-
-```sh
-arcushub scp firmware.bin LWR-2389:/tmp/
-arcushub scp LWR-2389:/var/log/messages ./messages
+arcushub agent reset LWR-2389
 ```
 
 ### Common options

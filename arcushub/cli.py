@@ -511,12 +511,17 @@ def reboot(host, port, user, password):
         client.close()
 
 
-@cli.command("restart-agent")
+@cli.group()
+def agent():
+    """Hub agent management commands."""
+
+
+@agent.command()
 @click.argument("host")
 @click.option("--port", default=22, help="SSH port.")
 @click.option("--user", default="root", help="SSH username.")
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
-def restart_agent(host, port, user, password):
+def restart(host, port, user, password):
     """Restart the hub agent. HOST can be an IP address, hostname, or hub ID."""
     host = _resolve_host(host)
     try:
@@ -532,12 +537,12 @@ def restart_agent(host, port, user, password):
         client.close()
 
 
-@cli.command("agent-reinstall")
+@agent.command()
 @click.argument("host")
 @click.option("--port", default=22, help="SSH port.")
 @click.option("--user", default="root", help="SSH username.")
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
-def agent_reinstall(host, port, user, password):
+def reinstall(host, port, user, password):
     """Reinstall the hub agent. Deletes /data/agent and reboots to re-extract from tarball.
 
     Preserves pairing data in /data/iris. HOST can be an IP, hostname, or hub ID.
@@ -556,12 +561,12 @@ def agent_reinstall(host, port, user, password):
         client.close()
 
 
-@cli.command("agent-reset")
+@agent.command()
 @click.argument("host")
 @click.option("--port", default=22, help="SSH port.")
 @click.option("--user", default="root", help="SSH username.")
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
-def agent_reset(host, port, user, password):
+def reset(host, port, user, password):
     """Factory reset the hub agent. Deletes /data/agent AND /data/iris, then reboots.
 
     WARNING: This wipes all pairing data. HOST can be an IP, hostname, or hub ID.
@@ -583,24 +588,23 @@ def agent_reset(host, port, user, password):
         client.close()
 
 
-@cli.command("agent-install")
+@agent.command()
 @click.argument("host")
 @click.argument("tarfile", type=click.Path(exists=True, path_type=Path))
 @click.option("--port", default=22, help="SSH port.")
 @click.option("--user", default="root", help="SSH username.")
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
-def agent_install(host, tarfile, port, user, password):
+def install(host, tarfile, port, user, password):
     """Install a new agent tarball on a hub. Uploads the tarball, removes /data/agent, and reboots.
 
     Preserves pairing data in /data/iris. HOST can be an IP, hostname, or hub ID.
 
     \b
     Examples:
-      arcushub agent-install LWR-2389 iris-agent-hub.tgz
-      arcushub agent-install 10.0.1.5 ./build/iris-agent-hub.tar.gz
+      arcushub agent install LWR-2389 iris-agent-hub.tgz
+      arcushub agent install 10.0.1.5 ./build/iris-agent-hub.tar.gz
     """
     host = _resolve_host(host)
-    remote_path = "/home/agent/iris-agent-hub"
 
     try:
         client = _connect(host, port=port, user=user, password=password)
@@ -631,13 +635,13 @@ def agent_install(host, tarfile, port, user, password):
         client.close()
 
 
-@cli.command("agent-test")
+@agent.command()
 @click.argument("host")
 @click.argument("tarfile", type=click.Path(exists=True, path_type=Path))
 @click.option("--port", default=22, help="SSH port.")
 @click.option("--user", default="root", help="SSH username.")
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
-def agent_test(host, tarfile, port, user, password):
+def test(host, tarfile, port, user, password):
     """Upload and hot-swap an agent tarball without rebooting.
 
     Stops the agent, extracts the new tarball over /data/agent, and restarts it.
@@ -645,8 +649,8 @@ def agent_test(host, tarfile, port, user, password):
 
     \b
     Examples:
-      arcushub agent-test LWR-2389 iris-agent-hub.tgz
-      arcushub agent-test 10.0.1.5 ./build/iris-agent-hub.tar.gz
+      arcushub agent test LWR-2389 iris-agent-hub.tgz
+      arcushub agent test 10.0.1.5 ./build/iris-agent-hub.tar.gz
     """
     host = _resolve_host(host)
     tmp_path = "/tmp/iris-agent-hub"
@@ -688,6 +692,9 @@ def agent_test(host, tarfile, port, user, password):
         client.close()
 
 
+cli.add_command(agent)
+
+
 @cli.command()
 @click.argument("src")
 @click.argument("dst")
@@ -720,6 +727,17 @@ def scp(src, dst, port, user, password):
         raise click.ClickException("Cannot specify remote paths for both source and destination.")
     if not src_host and not dst_host:
         raise click.ClickException("One of source or destination must be a remote path (HOST:PATH).")
+
+    # Validate local file/directory exists before connecting
+    if src_host:
+        # Downloading: validate local destination directory
+        dst_dir = Path(dst_path) if Path(dst_path).is_dir() else Path(dst_path).parent
+        if not dst_dir.exists():
+            raise click.ClickException(f"Local directory does not exist: {dst_dir}")
+    else:
+        # Uploading: validate local source file exists
+        if not Path(src_path).exists():
+            raise click.ClickException(f"Local file not found: {src_path}")
 
     remote_host = src_host or dst_host
     remote_host = _resolve_host(remote_host)
