@@ -628,9 +628,11 @@ def install(host, tarfile, port, user, password):
             chan.shutdown_write()
             chan.recv_exit_status()
 
-        click.echo("Installing agent and rebooting...")
-        client.exec_command(f"agent_install {tmp_path}")
-        click.echo(f"Agent install initiated on {host}.")
+        with _spinner("Installing agent and rebooting"):
+            chan = client.get_transport().open_session()
+            chan.exec_command(f"PATH=/home/root/bin:$PATH agent_install {tmp_path}")
+            chan.recv_exit_status()
+        click.echo(f"Agent installed on {host}.")
     finally:
         client.close()
 
