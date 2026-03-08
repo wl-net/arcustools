@@ -732,6 +732,8 @@ def scp(src, dst, port, user, password):
     try:
         if src_host:
             # Download: cat remote file to local
+            if Path(dst_path).is_dir():
+                dst_path = str(Path(dst_path) / Path(src_path).name)
             prog = _Progress()
             with _spinner(f"Downloading {src_path} → {dst_path}", progress=prog):
                 chan = client.get_transport().open_session()
@@ -747,6 +749,12 @@ def scp(src, dst, port, user, password):
                     raise click.ClickException(f"Remote file not found: {src_path}")
         else:
             # Upload: pipe local file into cat on remote
+            # If remote path is a directory, append the source filename
+            chan = client.get_transport().open_session()
+            chan.exec_command(f"test -d {dst_path}")
+            if chan.recv_exit_status() == 0:
+                dst_path = dst_path.rstrip("/") + "/" + Path(src_path).name
+
             # Verify remote directory exists before transferring
             remote_dir = dst_path.rsplit("/", 1)[0] if "/" in dst_path else "."
             chan = client.get_transport().open_session()
@@ -813,13 +821,24 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, force):
             chan.shutdown_write()
             chan.recv_exit_status()
 
-        # Since we uploaded the file, use fwinstall
-        cmd_parts = ["fwinstall"]
-        if kill_agent:
-            cmd_parts.append("-k")
-        if skip_radio:
-            cmd_parts.append("-s")
-        cmd_parts.append(remote_path)
+        # Detect signed firmware (non-gzip) vs unsigned archive (gzip)
+        with open(firmware, "rb") as f:
+            signed = f.read(2) != b"\x1f\x8b"
+
+        if signed:
+            cmd_parts = ["update"]
+            if force:
+                cmd_parts.append("-f")
+            if kill_agent:
+                cmd_parts.append("-k")
+            cmd_parts.append(f"file://{remote_path}")
+        else:
+            cmd_parts = ["fwinstall"]
+            if kill_agent:
+                cmd_parts.append("-k")
+            if skip_radio:
+                cmd_parts.append("-s")
+            cmd_parts.append(remote_path)
         cmd = " ".join(cmd_parts)
 
         click.echo(f"Installing: {cmd}")
