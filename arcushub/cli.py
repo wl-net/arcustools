@@ -818,7 +818,7 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, force):
       arcushub flash 10.0.1.5 hub/v3/firmware/hubOSv3_3.0.1.025.bin
     """
     host = _resolve_host(host)
-    remote_path = f"/tmp/{firmware.name}"
+    remote_path = "/data/iris/data/tmp/hubOS.bin"
 
     try:
         client = _connect(host, port=port, user=user, password=password)
