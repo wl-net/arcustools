@@ -1038,13 +1038,7 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
         raise click.ClickException(str(e))
 
     try:
-        # Use /data/iris/data/tmp if it exists, otherwise fall back to /tmp
-        chan = client.get_transport().open_session()
-        chan.exec_command("test -d /data/iris/data/tmp")
-        if chan.recv_exit_status() == 0:
-            remote_path = "/data/iris/data/tmp/hubOS.bin"
-        else:
-            remote_path = "/tmp/hubOS.bin"
+        remote_path = "/data/iris/data/tmp/hubOS.bin"
 
         # Upload firmware via exec channel (hub SSH lacks SFTP)
         prog = _Progress(total=firmware.stat().st_size)
@@ -1094,6 +1088,10 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
             err = stderr.decode().strip() if stderr else f"exit code {exit_status}"
             raise click.ClickException(f"Firmware install failed: {err}")
         if wipe_agent:
+            with _spinner("Stopping agent"):
+                chan = client.get_transport().open_session()
+                chan.exec_command("/home/root/bin/agent_stop")
+                chan.recv_exit_status()
             with _spinner("Wiping /data/agent"):
                 chan = client.get_transport().open_session()
                 chan.exec_command("rm -rf /data/agent")
