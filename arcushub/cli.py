@@ -694,6 +694,219 @@ def test(host, tarfile, port, user, password):
         client.close()
 
 
+_ARCUSPLATFORM_DIST = Path.home() / "projects" / "arcusplatform" / "agent" / "arcus-agent" / "hub-v2" / "build" / "distributions"
+
+
+@agent.command()
+@click.argument("host")
+@click.option("--port", default=22, help="SSH port.")
+@click.option("--user", default="root", help="SSH username.")
+@click.option("--password", default=None, help="Override password (skip auto-detection).")
+@click.option("--dist", type=click.Path(exists=True, path_type=Path), default=None,
+              help="Path to distTar directory (default: ~/projects/arcusplatform/.../distributions).")
+@click.option("--all", "upload_all", is_flag=True, help="Upload all jars, not just changed ones.")
+def update(host, port, user, password, dist, upload_all):
+    """Update changed agent jars on a hub from the local distTar build.
+
+    Compares jar files in the local distTar archive with those on the hub,
+    uploads only the ones that differ (by size), and restarts the agent.
+
+    \b
+    Examples:
+      arcushub agent update LWR-2389
+      arcushub agent update LWR-2389 --all
+      arcushub agent update 10.0.1.5 --dist /path/to/distributions
+    """
+    import tarfile as tarfile_mod
+
+    dist_dir = dist or _ARCUSPLATFORM_DIST
+    if not dist_dir.exists():
+        raise click.ClickException(f"Distribution directory not found: {dist_dir}")
+
+    # Find the tarball
+    tarballs = sorted(dist_dir.glob("*.tar.gz")) + sorted(dist_dir.glob("*.tgz"))
+    if not tarballs:
+        raise click.ClickException(f"No .tar.gz or .tgz files found in {dist_dir}")
+    tarball = tarballs[-1]
+    click.echo(f"Using {tarball.name}")
+
+    # Extract jar info from tarball
+    local_jars = {}
+    with tarfile_mod.open(tarball, "r:gz") as tf:
+        for member in tf.getmembers():
+            if member.name.startswith("libs/") and member.name.endswith(".jar"):
+                jar_name = member.name[5:]  # strip "libs/"
+                local_jars[jar_name] = member.size
+
+    if not local_jars:
+        raise click.ClickException("No jars found in tarball.")
+
+    host = _resolve_host(host)
+    try:
+        client = _connect(host, port=port, user=user, password=password)
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+    try:
+        # Get jar sizes from hub
+        remote_jars = {}
+        with _spinner("Reading hub jars"):
+            chan = client.get_transport().open_session()
+            chan.exec_command("ls -l /data/agent/libs/*.jar 2>/dev/null")
+            output = b""
+            while True:
+                data = chan.recv(65536)
+                if not data:
+                    break
+                output += data
+            chan.recv_exit_status()
+
+        for line in output.decode().splitlines():
+            parts = line.split()
+            if len(parts) >= 9 and parts[-1].endswith(".jar"):
+                jar_name = parts[-1].rsplit("/", 1)[-1]
+                try:
+                    remote_jars[jar_name] = int(parts[4])
+                except ValueError:
+                    pass
+
+        # Determine which jars need updating
+        if upload_all:
+            changed = sorted(local_jars.keys())
+        else:
+            changed = []
+            for jar_name, local_size in sorted(local_jars.items()):
+                remote_size = remote_jars.get(jar_name)
+                if remote_size is None or remote_size != local_size:
+                    changed.append(jar_name)
+
+        if not changed:
+            click.echo("All jars are up to date.")
+            return
+
+        click.echo(f"{len(changed)} jar{'s' if len(changed) != 1 else ''} to update:")
+        for jar_name in changed:
+            local_size = local_jars[jar_name]
+            remote_size = remote_jars.get(jar_name)
+            if remote_size is None:
+                click.echo(f"  + {jar_name} ({_format_size(local_size)})")
+            else:
+                click.echo(f"  ~ {jar_name} ({_format_size(remote_size)} → {_format_size(local_size)})")
+
+        # Stop the agent before uploading
+        with _spinner("Stopping agent"):
+            chan = client.get_transport().open_session()
+            chan.exec_command("killall java")
+            chan.recv_exit_status()
+
+        # Extract and upload changed jars
+        with tarfile_mod.open(tarball, "r:gz") as tf:
+            for jar_name in changed:
+                member = tf.getmember(f"libs/{jar_name}")
+                jar_data = tf.extractfile(member).read()
+                remote_path = f"/data/agent/libs/{jar_name}"
+
+                prog = _Progress(total=len(jar_data))
+                with _spinner(f"Uploading {jar_name}", progress=prog):
+                    chan = client.get_transport().open_session()
+                    chan.exec_command(f"cat > {remote_path}")
+                    offset = 0
+                    while offset < len(jar_data):
+                        chunk = jar_data[offset:offset + 65536]
+                        chan.sendall(chunk)
+                        prog.update(len(chunk))
+                        offset += len(chunk)
+                    chan.shutdown_write()
+                    chan.recv_exit_status()
+
+        # Fix ownership and restart
+        with _spinner("Restarting agent"):
+            chan = client.get_transport().open_session()
+            chan.exec_command(
+                "chown agent:agent /data/agent/libs/*.jar && "
+                "agent_start"
+            )
+            chan.recv_exit_status()
+
+        click.echo(f"Updated {len(changed)} jar{'s' if len(changed) != 1 else ''} on {host}.")
+    finally:
+        client.close()
+
+
+@agent.command()
+@click.argument("host")
+@click.argument("key", required=False, default=None)
+@click.argument("value", required=False, default=None)
+@click.option("--port", default=22, help="SSH port.")
+@click.option("--user", default="root", help="SSH username.")
+@click.option("--password", default=None, help="Override password (skip auto-detection).")
+def config(host, key, value, port, user, password):
+    """Get, set, or list hub database config values.
+
+    HOST can be an IP address, hostname, or hub ID.
+
+    \b
+    Examples:
+      arcushub agent config 10.0.1.5                          # list all keys
+      arcushub agent config LWR-2389 iris.gateway.uri         # get value
+      arcushub agent config LWR-2389 iris.gateway.uri wss://… # set value
+    """
+    import shlex
+
+    db_path = "/data/iris/db/iris.db"
+    host = _resolve_host(host)
+
+    if value is not None:
+        # Set mode
+        sql_key = key.replace("'", "''")
+        sql_val = value.replace("'", "''")
+        sql = (
+            f"INSERT OR REPLACE INTO config (key,value,lastUpdateTime,lastReportTime) "
+            f"VALUES ('{sql_key}','{sql_val}',0,0);"
+        )
+    elif key is not None:
+        # Get mode
+        sql_key = key.replace("'", "''")
+        sql = f"SELECT value FROM config WHERE key='{sql_key}';"
+    else:
+        # List mode
+        sql = "SELECT key, value FROM config ORDER BY key;"
+
+    cmd = f"sqlite3 {db_path} {shlex.quote(sql)}"
+
+    try:
+        client = _connect(host, port=port, user=user, password=password)
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+    try:
+        chan = client.get_transport().open_session()
+        chan.exec_command(cmd)
+        output = b""
+        while True:
+            data = chan.recv(4096)
+            if not data:
+                break
+            output += data
+        stderr = chan.recv_stderr(4096)
+        exit_code = chan.recv_exit_status()
+
+        if exit_code != 0:
+            err_msg = stderr.decode().strip() if stderr else "unknown error"
+            raise click.ClickException(f"sqlite3 failed: {err_msg}")
+
+        text = output.decode().strip()
+        if value is not None:
+            click.echo(f"Set {key}={value}")
+        elif text:
+            click.echo(text)
+        else:
+            if key is not None:
+                click.echo(f"No config entry for '{key}'.")
+    finally:
+        client.close()
+
+
 cli.add_command(agent)
 
 
@@ -808,8 +1021,8 @@ def scp(src, dst, port, user, password):
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
 @click.option("-k", "--kill-agent", is_flag=True, help="Kill agent before installing radio firmware.")
 @click.option("-s", "--skip-radio", is_flag=True, help="Skip install of radio firmware.")
-@click.option("-f", "--force", is_flag=True, help="Force install even if version is the same.")
-def flash(host, firmware, port, user, password, kill_agent, skip_radio, force):
+@click.option("-w", "--wipe-agent", is_flag=True, help="Remove /data/agent before installing firmware.")
+def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_agent):
     """Upload and install firmware on a hub. HOST can be an IP, hostname, or hub ID.
 
     \b
@@ -846,9 +1059,7 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, force):
             signed = f.read(2) != b"\x1f\x8b"
 
         if signed:
-            cmd_parts = ["update"]
-            if force:
-                cmd_parts.append("-f")
+            cmd_parts = ["update", "-f"]
             if kill_agent:
                 cmd_parts.append("-k")
             cmd_parts.append(f"file://{remote_path}")
@@ -875,6 +1086,12 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, force):
         if exit_status != 0:
             err = stderr.decode().strip() if stderr else f"exit code {exit_status}"
             raise click.ClickException(f"Firmware install failed: {err}")
+        if wipe_agent:
+            with _spinner("Wiping /data/agent"):
+                chan = client.get_transport().open_session()
+                chan.exec_command("rm -rf /data/agent")
+                chan.recv_exit_status()
+
         click.echo("Firmware install complete. Rebooting...")
         chan = client.get_transport().open_session()
         chan.exec_command("reboot")
