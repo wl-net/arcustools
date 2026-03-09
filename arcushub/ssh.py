@@ -9,9 +9,9 @@ import tty
 import paramiko
 
 ROOT_PASSWORDS = [
+    r"3XSgE27w5VJ3qvxK33dn",  # source builds
     r"zm{[*f6gB5X($]R9",   # hubOS 3.x releases
     r"kz58!~Eb.RZ?+bqb",   # hubOS 2.x releases
-    r"3XSgE27w5VJ3qvxK33dn",  # source builds
 ]
 
 
