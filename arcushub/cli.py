@@ -1031,7 +1031,6 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
       arcushub flash 10.0.1.5 hub/v3/firmware/hubOSv3_3.0.1.025.bin
     """
     host = _resolve_host(host)
-    remote_path = "/data/iris/data/tmp/hubOS.bin"
 
     try:
         client = _connect(host, port=port, user=user, password=password)
@@ -1039,6 +1038,14 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
         raise click.ClickException(str(e))
 
     try:
+        # Use /data/iris/data/tmp if it exists, otherwise fall back to /tmp
+        chan = client.get_transport().open_session()
+        chan.exec_command("test -d /data/iris/data/tmp")
+        if chan.recv_exit_status() == 0:
+            remote_path = "/data/iris/data/tmp/hubOS.bin"
+        else:
+            remote_path = "/tmp/hubOS.bin"
+
         # Upload firmware via exec channel (hub SSH lacks SFTP)
         prog = _Progress(total=firmware.stat().st_size)
         with _spinner(f"Uploading {firmware.name} → {remote_path}", progress=prog):
