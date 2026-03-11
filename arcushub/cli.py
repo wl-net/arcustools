@@ -1106,6 +1106,11 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
                 chan.exec_command("rm -rf /data/agent")
                 chan.recv_exit_status()
 
+        # Clean up uploaded firmware
+        chan = client.get_transport().open_session()
+        chan.exec_command(f"rm -f {remote_path}")
+        chan.recv_exit_status()
+
         click.echo("Firmware install complete. Rebooting...")
         chan = client.get_transport().open_session()
         chan.exec_command("/sbin/reboot")
