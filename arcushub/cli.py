@@ -1038,7 +1038,16 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
         raise click.ClickException(str(e))
 
     try:
-        remote_path = "/data/iris/data/tmp/hubOS.bin"
+        # Ensure upload directory exists; fall back to /tmp if
+        # /data/iris/data/tmp cannot be created (agent may be broken).
+        remote_dir = "/data/iris/data/tmp"
+        chan = client.get_transport().open_session()
+        chan.exec_command(f"mkdir -p {remote_dir} 2>/dev/null && echo ok")
+        result = chan.recv(16).decode().strip()
+        chan.close()
+        if result != "ok":
+            remote_dir = "/tmp"
+        remote_path = f"{remote_dir}/hubOS.bin"
 
         # Upload firmware via exec channel (hub SSH lacks SFTP)
         prog = _Progress(total=firmware.stat().st_size)
@@ -1099,7 +1108,7 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
 
         click.echo("Firmware install complete. Rebooting...")
         chan = client.get_transport().open_session()
-        chan.exec_command("reboot")
+        chan.exec_command("/sbin/reboot")
         chan.recv_exit_status()
     finally:
         client.close()
