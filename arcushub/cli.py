@@ -1042,7 +1042,7 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
         # /data/iris/data/tmp cannot be created (agent may be broken).
         remote_dir = "/data/iris/data/tmp"
         chan = client.get_transport().open_session()
-        chan.exec_command(f"mkdir -p {remote_dir} 2>/dev/null && echo ok")
+        chan.exec_command(f"mkdir -p {remote_dir} && chown agent:agent {remote_dir} 2>/dev/null && echo ok")
         result = chan.recv(16).decode().strip()
         chan.close()
         if result != "ok":
