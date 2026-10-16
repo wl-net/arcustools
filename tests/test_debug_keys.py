@@ -26,7 +26,7 @@ def test_missing_archive_raises(tmp_path):
     ("LWA-1234", "Debug key archive not found"),
 ])
 def test_cli_errors_are_clean(tmp_path, hub_id, message):
-    result = CliRunner().invoke(cli, ["debug-key", hub_id, "-o", str(tmp_path / "k.dbg")])
+    result = CliRunner().invoke(cli, ["debug-key", hub_id, "--data-dir", str(DATA_DIR), "-o", str(tmp_path / "k.dbg")])
     assert result.exit_code == 1
     assert message in result.output
     assert "Traceback" not in result.output
@@ -34,6 +34,6 @@ def test_cli_errors_are_clean(tmp_path, hub_id, message):
 
 def test_cli_output_to_new_directory(tmp_path):
     dest = tmp_path / "new" / "dir" / "key.dbg"
-    result = CliRunner().invoke(cli, ["debug-key", "LWH-9589", "-o", str(dest)])
+    result = CliRunner().invoke(cli, ["debug-key", "LWH-9589", "--data-dir", str(DATA_DIR), "-o", str(dest)])
     assert result.exit_code == 0, result.output
     assert dest.stat().st_size == 512
