@@ -903,9 +903,9 @@ def scp(src, dst, port, user, password):
 @click.argument("host")
 @click.argument("firmware", type=click.Path(exists=True, path_type=Path))
 @_hub_options
-@click.option("-k", "--kill-agent", is_flag=True, help="Kill agent before installing radio firmware.")
-@click.option("-s", "--skip-radio", is_flag=True, help="Skip install of radio firmware.")
-@click.option("-w", "--wipe-agent", is_flag=True, help="Remove /data/agent before installing firmware.")
+@click.option("-k", "--kill-agent", is_flag=True, help="Pass -k to update/fwinstall (kill agent before radio install).")
+@click.option("-s", "--skip-radio", is_flag=True, help="Skip install of radio firmware (unsigned archives only).")
+@click.option("-w", "--wipe-agent", is_flag=True, help="Remove /data/agent after installing firmware.")
 def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_agent):
     """Upload and install firmware on a hub. HOST can be an IP, hostname, or hub ID.
 

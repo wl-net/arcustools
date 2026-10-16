@@ -34,7 +34,7 @@ Hub IDs are derived from the hub's MAC address using a base-23 encoding scheme. 
 
 #### `arcushub ssh <host> [command...]`
 
-SSH into a hub as root. Automatically tries known root passwords for hubOS 2.x, 3.x, and source builds. If a command is given, runs it on the hub and exits. Otherwise opens an interactive shell.
+SSH into a hub as root. Tries your local SSH keys first (see `setup-ssh-key`), then the known root passwords for hubOS 2.x, 3.x, and source builds. If a command is given, runs it on the hub and exits. Otherwise opens an interactive shell.
 
 ```sh
 arcushub ssh LWR-2389
@@ -82,13 +82,15 @@ arcushub logs LWR-2389 -f -n 100    # follow, showing last 100 lines
 
 #### `arcushub flash <host> <firmware>`
 
-Upload and install firmware on a hub. Automatically detects signed firmware (uses `update`) vs unsigned archives (uses `fwinstall`).
+Upload and install firmware on a hub, then reboot it. Automatically detects signed firmware (uses `update`) vs unsigned archives (uses `fwinstall`).
+
+The agent is always stopped before installing: the hub stages the decrypted image in `/tmp` (RAM), and with the agent running a large image can exhaust memory and reboot the hub mid-install. Install progress streams live; the install takes several minutes and should not be interrupted.
 
 ```sh
 arcushub flash LWR-2389 hub/v2/firmware/hubOS_2.2.0.009.bin
-arcushub flash LWR-2389 hub/v3/firmware/hubOSv3_3.0.1.025.bin -k    # kill agent first
-arcushub flash LWR-2389 firmware.bin -s                               # skip radio firmware
-arcushub flash LWR-2389 firmware.bin -f                               # force install
+arcushub flash LWR-2389 hub/v3/firmware/hubOSv3_3.0.1.025.bin -k    # pass -k (kill agent) to update/fwinstall
+arcushub flash LWR-2389 firmware.bin -s                               # skip radio firmware (unsigned archives only)
+arcushub flash LWR-2389 firmware.bin -w                               # also wipe /data/agent after installing
 ```
 
 #### `arcushub reboot <host>`
@@ -115,6 +117,7 @@ Extract the `.dbg` debug key file for a hub from the local ZIP archives in `hub/
 ```sh
 arcushub debug-key LWC-8045                    # outputs LWC-8045.dbg to current dir
 arcushub debug-key LWC-8045 -o /tmp/key.dbg    # custom output path
+arcushub debug-key LWC-8045 --data-dir /path/to/hub   # use archives from another directory
 ```
 
 #### `arcushub enable-dropbear <host>`
@@ -144,6 +147,26 @@ Restart the hub agent (runs `agent_stop` then `agent_start`).
 
 ```sh
 arcushub agent restart LWR-2389
+```
+
+#### `arcushub agent update <host>`
+
+Update changed agent jars from a local arcusplatform `distTar` build. Compares jars by MD5, uploads only the ones that differ, and restarts the agent. Use `--all` to upload every jar, or `--dist` to point at a different distributions directory (default: `~/projects/arcusplatform/.../distributions`).
+
+```sh
+arcushub agent update LWR-2389
+arcushub agent update LWR-2389 --all
+arcushub agent update LWR-2389 --dist /path/to/distributions
+```
+
+#### `arcushub agent config <host> [key] [value]`
+
+Get, set, or list hub database config values. With no key, lists all keys; with a key, prints its value; with a key and value, sets it.
+
+```sh
+arcushub agent config LWR-2389                            # list all keys
+arcushub agent config LWR-2389 iris.gateway.uri           # get value
+arcushub agent config LWR-2389 iris.gateway.uri wss://…   # set value
 ```
 
 #### `arcushub agent install <host> <tarfile>`
