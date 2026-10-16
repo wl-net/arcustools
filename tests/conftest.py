@@ -36,10 +36,14 @@ class FakeChannel:
         self._close_stdin()
 
     def _close_stdin(self):
+        if self._proc.stdin is None:
+            return
         try:
             self._proc.stdin.close()
         except BrokenPipeError:
             pass
+        # Python 3.9's communicate() flushes stdin even when it's already closed
+        self._proc.stdin = None
 
     def _finish(self):
         if not self._done:
