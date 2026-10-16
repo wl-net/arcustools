@@ -115,6 +115,9 @@ def _is_reachable(ip: str, port: int = 22, timeout: float = 1.0) -> bool:
         return False
 
 
+_ATF_COM = 0x2  # /proc/net/arp flag: entry is complete (resolved)
+
+
 def _find_all_hubs_in_arp() -> list[tuple[str, str]]:
     """Scan ARP table for all MACs matching known Arcus OUIs. Returns [(ip, mac), ...]."""
     from .hubid import KNOWN_OUIS
@@ -133,7 +136,9 @@ def _find_all_hubs_in_arp() -> list[tuple[str, str]]:
                 if len(fields) >= 4:
                     ip_addr = fields[0]
                     raw_mac = fields[3]
-                    if raw_mac == "00:00:00:00:00:00":
+                    # Skip incomplete/failed entries: the kernel keeps the last
+                    # MAC around after the host stops answering at this IP.
+                    if not int(fields[2], 16) & _ATF_COM:
                         continue
                     norm = ":".join(f"{int(b, 16):02x}" for b in raw_mac.split(":"))
                     if norm[:8] in oui_prefixes:
@@ -173,7 +178,9 @@ def _find_in_arp(mac_even: str, mac_odd: str) -> str | None:
                 if len(fields) >= 4:
                     ip_addr = fields[0]
                     raw_mac = fields[3]
-                    if raw_mac == "00:00:00:00:00:00":
+                    # Skip incomplete/failed entries: the kernel keeps the last
+                    # MAC around after the host stops answering at this IP.
+                    if not int(fields[2], 16) & _ATF_COM:
                         continue
                     norm = ":".join(f"{int(b, 16):02x}" for b in raw_mac.split(":"))
                     if norm in (mac_even, mac_odd):
