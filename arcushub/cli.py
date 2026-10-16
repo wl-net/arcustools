@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import io
+import shlex
 import sys
 import threading
 import time
@@ -41,6 +45,7 @@ class _Progress:
 def _spinner(message: str, progress: _Progress | None = None):
     """Show a braille spinner with a message while work runs in the block."""
     stop = threading.Event()
+    failed = threading.Event()
 
     def spin():
         i = 0
@@ -51,12 +56,16 @@ def _spinner(message: str, progress: _Progress | None = None):
             i += 1
             stop.wait(0.08)
         suffix = f"  {progress.status()}" if progress else ""
-        click.echo(f"\r\033[K✔ {message}{suffix}")
+        mark = "✘" if failed.is_set() else "✔"
+        click.echo(f"\r\033[K{mark} {message}{suffix}")
 
     t = threading.Thread(target=spin, daemon=True)
     t.start()
     try:
         yield
+    except BaseException:
+        failed.set()
+        raise
     finally:
         stop.set()
         t.join()
@@ -197,6 +206,47 @@ def _connect(host: str, port: int = 22, user: str = "root", password: str | None
     with _spinner(f"Connecting to {user}@{host}:{port}"):
         client = connect(host, port=port, user=user, password=password)
     return client
+
+
+def _upload(client, fileobj, size: int, remote_path: str, label: str) -> None:
+    """Stream fileobj to remote_path via `cat` (hub SSH lacks SFTP) and verify it arrived intact.
+
+    Raises ClickException and removes the partial remote file if the write fails
+    or the remote size doesn't match.
+    """
+    quoted = shlex.quote(remote_path)
+    prog = _Progress(total=size)
+    try:
+        with _spinner(label, progress=prog):
+            chan = client.get_transport().open_session()
+            chan.exec_command(f"cat > {quoted}")
+            try:
+                while True:
+                    chunk = fileobj.read(65536)
+                    if not chunk:
+                        break
+                    chan.sendall(chunk)
+                    prog.update(len(chunk))
+                chan.shutdown_write()
+            except (OSError, EOFError):
+                pass  # remote cat died early; exit status below explains why
+            status = chan.recv_exit_status()
+            if status != 0:
+                err = chan.recv_stderr(4096).decode(errors="replace").strip()
+                raise click.ClickException(f"Upload to {remote_path} failed: {err or f'exit code {status}'}")
+
+            chan = client.get_transport().open_session()
+            chan.exec_command(f"wc -c < {quoted}")
+            remote_size = chan.makefile("rb").read().decode().strip()
+            if remote_size != str(size):
+                raise click.ClickException(
+                    f"Upload to {remote_path} incomplete: {remote_size or '?'} of {size} bytes written"
+                )
+    except click.ClickException:
+        chan = client.get_transport().open_session()
+        chan.exec_command(f"rm -f {quoted}")
+        chan.recv_exit_status()
+        raise
 
 
 def _resolve_host(host: str, timeout: float = 5.0) -> str:
@@ -484,7 +534,8 @@ def ping(host, port, user, password):
         if uptime:
             click.echo(f"  Uptime: {uptime}")
 
-        _stdin, stdout, _stderr = client.exec_command("pgrep -f hubAgent")
+        # Bracket keeps the pattern from matching the `sh -c` wrapper running pgrep
+        _stdin, stdout, _stderr = client.exec_command("pgrep -f '[h]ubAgent'")
         agent_pid = stdout.read().decode().strip()
         click.echo(f"  Hub agent: {'running (pid ' + agent_pid.splitlines()[0] + ')' if agent_pid else 'not running'}")
     finally:
@@ -614,19 +665,8 @@ def install(host, tarfile, port, user, password):
     tmp_path = "/tmp/iris-agent-hub"
 
     try:
-        prog = _Progress(total=Path(tarfile).stat().st_size)
-        with _spinner(f"Uploading {tarfile} → {tmp_path}", progress=prog):
-            chan = client.get_transport().open_session()
-            chan.exec_command(f"cat > {tmp_path}")
-            with open(tarfile, "rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    chan.sendall(chunk)
-                    prog.update(len(chunk))
-            chan.shutdown_write()
-            chan.recv_exit_status()
+        with open(tarfile, "rb") as f:
+            _upload(client, f, Path(tarfile).stat().st_size, tmp_path, f"Uploading {tarfile} → {tmp_path}")
 
         with _spinner("Installing agent and rebooting"):
             chan = client.get_transport().open_session()
@@ -663,19 +703,8 @@ def test(host, tarfile, port, user, password):
         raise click.ClickException(str(e))
 
     try:
-        prog = _Progress(total=Path(tarfile).stat().st_size)
-        with _spinner(f"Uploading {tarfile} → {tmp_path}", progress=prog):
-            chan = client.get_transport().open_session()
-            chan.exec_command(f"cat > {tmp_path}")
-            with open(tarfile, "rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    chan.sendall(chunk)
-                    prog.update(len(chunk))
-            chan.shutdown_write()
-            chan.recv_exit_status()
+        with open(tarfile, "rb") as f:
+            _upload(client, f, Path(tarfile).stat().st_size, tmp_path, f"Uploading {tarfile} → {tmp_path}")
 
         click.echo("Stopping agent, extracting, and restarting...")
         install_cmd = (
@@ -806,18 +835,7 @@ def update(host, port, user, password, dist, upload_all):
                 jar_data = tf.extractfile(member).read()
                 remote_path = f"/data/agent/libs/{jar_name}"
 
-                prog = _Progress(total=len(jar_data))
-                with _spinner(f"Uploading {jar_name}", progress=prog):
-                    chan = client.get_transport().open_session()
-                    chan.exec_command(f"cat > {remote_path}")
-                    offset = 0
-                    while offset < len(jar_data):
-                        chunk = jar_data[offset:offset + 65536]
-                        chan.sendall(chunk)
-                        prog.update(len(chunk))
-                        offset += len(chunk)
-                    chan.shutdown_write()
-                    chan.recv_exit_status()
+                _upload(client, io.BytesIO(jar_data), len(jar_data), remote_path, f"Uploading {jar_name}")
 
         # Fix ownership and restart
         with _spinner("Restarting agent"):
@@ -995,20 +1013,8 @@ def scp(src, dst, port, user, password):
             if chan.recv_exit_status() != 0:
                 raise click.ClickException(f"Remote directory does not exist: {remote_dir}")
 
-            total = Path(src_path).stat().st_size
-            prog = _Progress(total=total)
-            with _spinner(f"Uploading {src_path} → {dst_path}", progress=prog):
-                chan = client.get_transport().open_session()
-                chan.exec_command(f"cat > {dst_path}")
-                with open(src_path, "rb") as f:
-                    while True:
-                        chunk = f.read(65536)
-                        if not chunk:
-                            break
-                        chan.sendall(chunk)
-                        prog.update(len(chunk))
-                chan.shutdown_write()
-                chan.recv_exit_status()
+            with open(src_path, "rb") as f:
+                _upload(client, f, Path(src_path).stat().st_size, dst_path, f"Uploading {src_path} → {dst_path}")
     finally:
         client.close()
 
@@ -1050,19 +1056,8 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
         remote_path = f"{remote_dir}/hubOS.bin"
 
         # Upload firmware via exec channel (hub SSH lacks SFTP)
-        prog = _Progress(total=firmware.stat().st_size)
-        with _spinner(f"Uploading {firmware.name} → {remote_path}", progress=prog):
-            chan = client.get_transport().open_session()
-            chan.exec_command(f"cat > {remote_path}")
-            with open(firmware, "rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    chan.sendall(chunk)
-                    prog.update(len(chunk))
-            chan.shutdown_write()
-            chan.recv_exit_status()
+        with open(firmware, "rb") as f:
+            _upload(client, f, firmware.stat().st_size, remote_path, f"Uploading {firmware.name} → {remote_path}")
 
         # Detect signed firmware (non-gzip) vs unsigned archive (gzip)
         with open(firmware, "rb") as f:
