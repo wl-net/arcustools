@@ -12,6 +12,9 @@ dependencies = [
     "paramiko",
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [tool.setuptools.packages.find]
 include = ["arcushub*"]
 
@@ -25,3 +28,6 @@ line-length = 120
 [tool.ruff.lint]
 # pyflakes, pycodestyle, import order, bugbear, pyupgrade (pinned to 3.9 by target-version)
 select = ["E", "W", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

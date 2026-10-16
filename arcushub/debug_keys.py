@@ -2,7 +2,7 @@ import re
 import zipfile
 from pathlib import Path
 
-HUB_ID_RE = re.compile(r"^([A-Z]{2,3})-(\d{4})$")
+HUB_ID_RE = re.compile(r"^([A-Z]{3})-(\d{4})$")
 
 VERSION_MAP = {
     "LW": "v2",

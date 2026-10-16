@@ -14,8 +14,8 @@ jobs:
         with:
           args: check
 
-  # Catches syntax/typing features newer than requires-python before they ship.
-  install:
+  # Running on the oldest supported Python catches syntax newer than requires-python.
+  test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -25,6 +25,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install .
+      - run: pip install ".[test]"
       - run: arcushub --help
-      - run: python -c "import arcushub.cli, arcushub.ssh, arcushub.ssdp, arcushub.hubid, arcushub.debug_keys"
+      - run: pytest
