@@ -198,6 +198,9 @@ def _connect(host: str, port: int = 22, user: str = "root", password: str | None
 
     with _spinner(f"Connecting to {user}@{host}:{port}"):
         client = connect(host, port=port, user=user, password=password)
+    # Keepalives make a hub that reboots or drops off the network fail the
+    # connection instead of leaving reads waiting forever.
+    client.get_transport().set_keepalive(15)
     return client
 
 
@@ -241,6 +244,8 @@ def _pump(chan, out, err) -> int:
         # exit-status arrives after all data, so once it's here the buffers are complete
         if chan.exit_status_ready() and not chan.recv_ready() and not chan.recv_stderr_ready():
             return chan.recv_exit_status()
+        if chan.closed and not chan.recv_ready() and not chan.recv_stderr_ready():
+            return -1
 
 
 def _run(client, cmd: str, check: bool = True) -> str:
@@ -941,15 +946,24 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
             cmd_parts.append(remote_path)
         cmd = " ".join(cmd_parts)
 
-        click.echo(f"Installing: {cmd}")
+        # validate_image/fwinstall stage the decrypted image in /tmp, which is RAM;
+        # with the Java agent also resident, the hub runs out of memory. The hub
+        # reboots after flashing anyway, so stop the agent up front.
+        with _spinner("Stopping agent to free memory"):
+            _run(client, "/home/root/bin/agent_stop", check=False)
+
+        click.echo(f"Installing: {cmd} (this takes several minutes; do not interrupt)")
         chan = client.get_transport().open_session()
+        # update/fwinstall print progress without flushing, so on a plain pipe
+        # nothing appears until they exit; a PTY makes their stdout line-buffered.
+        chan.get_pty()
         chan.exec_command(cmd)
         exit_status = _pump(chan, sys.stdout.buffer, sys.stderr.buffer)
         if exit_status != 0:
-            raise click.ClickException(f"Firmware install failed (exit code {exit_status})")
+            raise click.ClickException(
+                f"Firmware install failed (exit code {exit_status}); agent is stopped, reboot the hub to restart it"
+            )
         if wipe_agent:
-            with _spinner("Stopping agent"):
-                _run(client, "/home/root/bin/agent_stop", check=False)
             with _spinner("Wiping /data/agent"):
                 _run(client, "rm -rf /data/agent")
 

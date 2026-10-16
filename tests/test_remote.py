@@ -6,7 +6,7 @@ import pytest
 from click.testing import CliRunner
 from conftest import FakeClient
 
-from arcushub.cli import _download, _run, _upload, cli
+from arcushub.cli import _download, _pump, _run, _upload, cli
 
 
 def test_run_returns_stdout():
@@ -85,3 +85,24 @@ def test_scp_missing_remote_dir(fake_hub, tmp_path):
     result = CliRunner().invoke(cli, ["scp", str(src), f"hub:{tmp_path}/nope/f"])
     assert result.exit_code == 1
     assert "Remote directory does not exist" in result.output
+
+
+def test_pump_returns_when_channel_closes_without_exit_status():
+    class DroppedChannel:
+        closed = True
+
+        def fileno(self):
+            r, w = os.pipe()
+            os.write(w, b"x")
+            return r
+
+        def recv_ready(self):
+            return False
+
+        def recv_stderr_ready(self):
+            return False
+
+        def exit_status_ready(self):
+            return False
+
+    assert _pump(DroppedChannel(), io.BytesIO(), io.BytesIO()) == -1

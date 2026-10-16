@@ -11,6 +11,7 @@ class FakeChannel:
 
     def __init__(self, truncate_after=None):
         self._truncate_after = truncate_after
+        self.closed = False
         self._done = False
         self._sent = 0
         # Always-readable fd so select() in _pump returns immediately
@@ -83,6 +84,9 @@ class FakeClient:
 
     def get_transport(self):
         return self
+
+    def set_keepalive(self, interval):
+        pass
 
     def open_session(self):
         chan = FakeChannel(self._truncate_after)
