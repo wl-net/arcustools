@@ -951,6 +951,12 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
         # reboots after flashing anyway, so stop the agent up front.
         with _spinner("Stopping agent to free memory"):
             _run(client, "/home/root/bin/agent_stop", check=False)
+        # On release images only the agent feeds the 300s hardware watchdog, and it
+        # leaves it armed when it exits. validate_image doesn't poke it (fwinstall
+        # does), so feed it ourselves until the install finishes. Capped at 30
+        # minutes in case we lose the connection.
+        feeder = client.get_transport().open_session()
+        feeder.exec_command("i=0; while [ $i -lt 30 ]; do echo A > /dev/watchdog0; i=$((i+1)); sleep 60; done")
 
         click.echo(f"Installing: {cmd} (this takes several minutes; do not interrupt)")
         chan = client.get_transport().open_session()
@@ -959,6 +965,7 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
         chan.get_pty()
         chan.exec_command(cmd)
         exit_status = _pump(chan, sys.stdout.buffer, sys.stderr.buffer)
+        feeder.close()
         if exit_status != 0:
             raise click.ClickException(
                 f"Firmware install failed (exit code {exit_status}); agent is stopped, reboot the hub to restart it"
