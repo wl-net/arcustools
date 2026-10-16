@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import io
+import select
 import shlex
 import sys
 import threading
-import time
 from contextlib import contextmanager
 from pathlib import Path
 
 import click
-
 
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -215,6 +214,37 @@ def _connect(host: str, port: int = 22, user: str = "root", password: str | None
     return client
 
 
+def _pump(chan, out, err) -> int:
+    """Copy a channel's stdout/stderr into out/err as data arrives; return the exit status.
+
+    Draining both streams together keeps a chatty stderr from filling its
+    window and stalling the remote command.
+    """
+    while True:
+        select.select([chan], [], [], 0.1)
+        while chan.recv_ready():
+            out.write(chan.recv(65536))
+            out.flush()
+        while chan.recv_stderr_ready():
+            err.write(chan.recv_stderr(65536))
+            err.flush()
+        # exit-status arrives after all data, so once it's here the buffers are complete
+        if chan.exit_status_ready() and not chan.recv_ready() and not chan.recv_stderr_ready():
+            return chan.recv_exit_status()
+
+
+def _run(client, cmd: str, check: bool = True) -> str:
+    """Run cmd on the hub and return its stdout. Raises ClickException on failure if check."""
+    chan = client.get_transport().open_session()
+    chan.exec_command(cmd)
+    out, err = io.BytesIO(), io.BytesIO()
+    status = _pump(chan, out, err)
+    if check and status != 0:
+        msg = err.getvalue().decode(errors="replace").strip() or f"exit code {status}"
+        raise click.ClickException(f"`{cmd}` failed: {msg}")
+    return out.getvalue().decode(errors="replace")
+
+
 def _upload(client, fileobj, size: int, remote_path: str, label: str) -> None:
     """Stream fileobj to remote_path via `cat` (hub SSH lacks SFTP) and verify it arrived intact.
 
@@ -276,10 +306,11 @@ def _resolve_host(host: str, timeout: float = 5.0) -> str:
     mac_even = ":".join(f"{b:02x}" for b in mac_bytes)
     mac_odd = ":".join(f"{b:02x}" for b in mac_bytes[:-1]) + f":{mac_bytes[-1] | 1:02x}"
 
-    # 1. Check cache
+    # 1. Check cache. The probe refreshes the ARP entry, so confirm the MAC
+    # at that IP is still this hub; DHCP may have handed it to another hub.
     cache = _load_cache()
     cached_ip = cache.get(hub_id)
-    if cached_ip and _is_reachable(cached_ip):
+    if cached_ip and _is_reachable(cached_ip) and _find_in_arp(mac_even, mac_odd) == cached_ip:
         return cached_ip
 
     click.echo(f"Resolving {hub_id} (MAC {mac_even} or {mac_odd})...")
@@ -327,22 +358,12 @@ def ssh(host, command, port, user, password):
     try:
         client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
     try:
         if command:
             chan = client.get_transport().open_session()
             chan.exec_command(" ".join(command))
-            while True:
-                data = chan.recv(4096)
-                if not data:
-                    break
-                sys.stdout.buffer.write(data)
-                sys.stdout.buffer.flush()
-            stderr = chan.recv_stderr(4096)
-            if stderr:
-                sys.stderr.buffer.write(stderr)
-                sys.stderr.buffer.flush()
-            sys.exit(chan.recv_exit_status())
+            sys.exit(_pump(chan, sys.stdout.buffer, sys.stderr.buffer))
         else:
             interactive_shell(client)
     finally:
@@ -352,8 +373,10 @@ def ssh(host, command, port, user, password):
 
 @cli.command("debug-key")
 @click.argument("hub_id")
-@click.option("--data-dir", type=click.Path(exists=True, path_type=Path), default=_DEFAULT_DATA_DIR, help="Path to hub data directory.")
-@click.option("--output", "-o", type=click.Path(path_type=Path), default=None, help="Output file path (default: ./<HUB_ID>.dbg).")
+@click.option("--data-dir", type=click.Path(exists=True, path_type=Path), default=_DEFAULT_DATA_DIR,
+              help="Path to hub data directory.")
+@click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
+              help="Output file path (default: ./<HUB_ID>.dbg).")
 def debug_key(hub_id, data_dir, output):
     """Extract the debug key file for a hub."""
     from .debug_keys import extract_debug_key
@@ -361,10 +384,9 @@ def debug_key(hub_id, data_dir, output):
     output_dir = output.parent if output else Path.cwd()
     if output:
         # If user gave a full output path, we extract to its parent and rename
-        hub_id_upper = hub_id.upper()
+        output.parent.mkdir(parents=True, exist_ok=True)
         out = extract_debug_key(hub_id, data_dir, output_dir)
         if out.name != output.name:
-            output.parent.mkdir(parents=True, exist_ok=True)
             out.rename(output)
             out = output
     else:
@@ -384,7 +406,7 @@ def enable_dropbear(host, port, user, password):
     try:
         client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     try:
         _stdin, stdout, stderr = client.exec_command("touch /data/config/enable_console")
@@ -402,7 +424,8 @@ def enable_dropbear(host, port, user, password):
 @click.option("--port", default=22, help="SSH port.")
 @click.option("--user", default="root", help="SSH username.")
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
-@click.option("--key", type=click.Path(exists=True, path_type=Path), default=None, help="Path to SSH public key file (default: auto-detect).")
+@click.option("--key", type=click.Path(exists=True, path_type=Path), default=None,
+              help="Path to SSH public key file (default: auto-detect).")
 def setup_ssh_key(host, port, user, password, key):
     """Push an SSH public key to a hub for passwordless login. HOST can be an IP, hostname, or hub ID."""
     if key is None:
@@ -424,16 +447,20 @@ def setup_ssh_key(host, port, user, password, key):
     try:
         client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     try:
-        cmd = f"mkdir -p /data/config/dropbear && cat >> /data/config/dropbear/authorized_keys << 'SSHKEY'\n{key_content}\nSSHKEY"
-        _stdin, stdout, stderr = client.exec_command(cmd)
-        exit_status = stdout.channel.recv_exit_status()
-        if exit_status != 0:
-            err = stderr.read().decode().strip()
-            raise click.ClickException(f"Failed to install SSH key: {err}")
-        click.echo("SSH key installed. You can now connect without a password.")
+        auth_keys = "/data/config/dropbear/authorized_keys"
+        quoted_key = shlex.quote(key_content)
+        # Print a marker only when appending, so re-running doesn't duplicate the key
+        cmd = (
+            f"mkdir -p /data/config/dropbear && touch {auth_keys} && "
+            f"(grep -qxF {quoted_key} {auth_keys} || (echo {quoted_key} >> {auth_keys} && echo added))"
+        )
+        if _run(client, cmd).strip() == "added":
+            click.echo("SSH key installed. You can now connect without a password.")
+        else:
+            click.echo("SSH key already installed.")
     finally:
         client.close()
 
@@ -541,8 +568,8 @@ def ping(host, port, user, password):
         if uptime:
             click.echo(f"  Uptime: {uptime}")
 
-        # Bracket keeps the pattern from matching the `sh -c` wrapper running pgrep
-        _stdin, stdout, _stderr = client.exec_command("pgrep -f '[h]ubAgent'")
+        # The agent is the hub's only JVM (agent_stop just does `killall java`)
+        _stdin, stdout, _stderr = client.exec_command("pidof java")
         agent_pid = stdout.read().decode().strip()
         click.echo(f"  Hub agent: {'running (pid ' + agent_pid.splitlines()[0] + ')' if agent_pid else 'not running'}")
     finally:
@@ -560,10 +587,10 @@ def reboot(host, port, user, password):
     try:
         client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     try:
-        client.exec_command("reboot")
+        client.exec_command("/sbin/reboot")
         click.echo(f"Reboot command sent to {host}.")
     finally:
         client.close()
@@ -585,11 +612,11 @@ def restart(host, port, user, password):
     try:
         client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     try:
-        _stdin, stdout, stderr = client.exec_command("/home/root/bin/agent_stop && /home/root/bin/agent_start")
-        stdout.channel.recv_exit_status()
+        with _spinner("Restarting agent"):
+            _run(client, "/home/root/bin/agent_stop && /home/root/bin/agent_start")
         click.echo(f"Agent restarted on {host}.")
     finally:
         client.close()
@@ -609,11 +636,11 @@ def reinstall(host, port, user, password):
     try:
         client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     try:
         click.echo("Removing /data/agent and rebooting...")
-        client.exec_command("rm -rf /data/agent && reboot")
+        client.exec_command("rm -rf /data/agent && /sbin/reboot")
         click.echo(f"Agent reinstall initiated on {host}.")
     finally:
         client.close()
@@ -636,11 +663,11 @@ def reset(host, port, user, password):
     try:
         client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     try:
         click.echo("Removing /data/agent and /data/iris, then rebooting...")
-        client.exec_command("rm -rf /data/agent /data/iris && reboot")
+        client.exec_command("rm -rf /data/agent /data/iris && /sbin/reboot")
         click.echo(f"Agent reset initiated on {host}.")
     finally:
         client.close()
@@ -667,7 +694,7 @@ def install(host, tarfile, port, user, password):
     try:
         client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     tmp_path = "/tmp/iris-agent-hub"
 
@@ -707,30 +734,30 @@ def test(host, tarfile, port, user, password):
     try:
         client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     try:
         with open(tarfile, "rb") as f:
             _upload(client, f, Path(tarfile).stat().st_size, tmp_path, f"Uploading {tarfile} → {tmp_path}")
 
-        click.echo("Stopping agent, extracting, and restarting...")
         install_cmd = (
             "killall java; "
             "cd /data/agent && "
             "rm -rf lib bin conf libs && rm -f * && "
             f"tar xf {tmp_path} && "
             "chown -R agent . && chgrp -R agent . && "
-            "agent_start"
+            "/home/root/bin/agent_start"
         )
-        chan = client.get_transport().open_session()
-        chan.exec_command(install_cmd)
-        chan.recv_exit_status()
+        with _spinner("Stopping agent, extracting, and restarting"):
+            _run(client, install_cmd)
         click.echo(f"Agent restarted on {host}.")
     finally:
         client.close()
 
 
-_ARCUSPLATFORM_DIST = Path.home() / "projects" / "arcusplatform" / "agent" / "arcus-agent" / "hub-v2" / "build" / "distributions"
+_ARCUSPLATFORM_DIST = (
+    Path.home() / "projects" / "arcusplatform" / "agent" / "arcus-agent" / "hub-v2" / "build" / "distributions"
+)
 
 
 @agent.command()
@@ -781,7 +808,7 @@ def update(host, port, user, password, dist, upload_all):
     try:
         client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     try:
         # Get jar sizes from hub
@@ -831,9 +858,7 @@ def update(host, port, user, password, dist, upload_all):
 
         # Stop the agent before uploading
         with _spinner("Stopping agent"):
-            chan = client.get_transport().open_session()
-            chan.exec_command("killall java")
-            chan.recv_exit_status()
+            _run(client, "killall java", check=False)
 
         # Extract and upload changed jars
         with tarfile_mod.open(tarball, "r:gz") as tf:
@@ -846,12 +871,7 @@ def update(host, port, user, password, dist, upload_all):
 
         # Fix ownership and restart
         with _spinner("Restarting agent"):
-            chan = client.get_transport().open_session()
-            chan.exec_command(
-                "chown agent:agent /data/agent/libs/*.jar && "
-                "agent_start"
-            )
-            chan.recv_exit_status()
+            _run(client, "chown agent:agent /data/agent/libs/*.jar && /home/root/bin/agent_start")
 
         click.echo(f"Updated {len(changed)} jar{'s' if len(changed) != 1 else ''} on {host}.")
     finally:
@@ -902,25 +922,10 @@ def config(host, key, value, port, user, password):
     try:
         client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     try:
-        chan = client.get_transport().open_session()
-        chan.exec_command(cmd)
-        output = b""
-        while True:
-            data = chan.recv(4096)
-            if not data:
-                break
-            output += data
-        stderr = chan.recv_stderr(4096)
-        exit_code = chan.recv_exit_status()
-
-        if exit_code != 0:
-            err_msg = stderr.decode().strip() if stderr else "unknown error"
-            raise click.ClickException(f"sqlite3 failed: {err_msg}")
-
-        text = output.decode().strip()
+        text = _run(client, cmd).strip()
         if value is not None:
             click.echo(f"Set {key}={value}")
         elif text:
@@ -985,7 +990,7 @@ def scp(src, dst, port, user, password):
     try:
         client = _connect(remote_host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     try:
         if src_host:
@@ -1048,7 +1053,7 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
     try:
         client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     try:
         # Ensure upload directory exists; fall back to /tmp if
@@ -1087,17 +1092,9 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
         click.echo(f"Installing: {cmd}")
         chan = client.get_transport().open_session()
         chan.exec_command(cmd)
-        while True:
-            data = chan.recv(4096)
-            if not data:
-                break
-            sys.stdout.buffer.write(data)
-            sys.stdout.buffer.flush()
-        stderr = chan.recv_stderr(4096)
-        exit_status = chan.recv_exit_status()
+        exit_status = _pump(chan, sys.stdout.buffer, sys.stderr.buffer)
         if exit_status != 0:
-            err = stderr.decode().strip() if stderr else f"exit code {exit_status}"
-            raise click.ClickException(f"Firmware install failed: {err}")
+            raise click.ClickException(f"Firmware install failed (exit code {exit_status})")
         if wipe_agent:
             with _spinner("Stopping agent"):
                 chan = client.get_transport().open_session()
@@ -1128,7 +1125,8 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
 @click.option("--password", default=None, help="Override password (skip auto-detection).")
 @click.option("-f", "--follow", is_flag=True, help="Follow the log in real time (like tail -f).")
 @click.option("-n", "--lines", default=50, help="Number of lines to show when following.")
-@click.option("-o", "--output", type=click.Path(path_type=Path), default=None, help="Save log to this file (default: hubAgent.log).")
+@click.option("-o", "--output", type=click.Path(path_type=Path), default=None,
+              help="Save log to this file (default: hubAgent.log).")
 def logs(host, port, user, password, follow, lines, output):
     """Download or follow /tmp/hubAgent.log on a hub. HOST can be an IP, hostname, or hub ID.
 
@@ -1146,7 +1144,7 @@ def logs(host, port, user, password, follow, lines, output):
     try:
         client = _connect(host, port=port, user=user, password=password)
     except Exception as e:
-        raise click.ClickException(str(e))
+        raise click.ClickException(str(e)) from e
 
     try:
         if follow:

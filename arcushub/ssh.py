@@ -18,12 +18,24 @@ ROOT_PASSWORDS = [
 
 
 def connect(host: str, port: int = 22, user: str = "root", password: str | None = None) -> paramiko.SSHClient:
-    """Connect to a hub via SSH, trying known passwords if none is provided."""
+    """Connect to a hub via SSH.
+
+    With an explicit password, use only that. Otherwise try local SSH keys
+    (installed by `arcushub setup-ssh-key`) first, then the known passwords.
+    """
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-    passwords = [password] if password else ROOT_PASSWORDS
     last_err = None
+    if not password:
+        try:
+            client.connect(host, port=port, username=user, look_for_keys=True, allow_agent=True)
+            return client
+        except paramiko.SSHException as e:
+            # AuthenticationException, or "No authentication methods available" with no keys
+            last_err = e
+
+    passwords = [password] if password else ROOT_PASSWORDS
     for pw in passwords:
         try:
             client.connect(

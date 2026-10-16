@@ -1,7 +1,6 @@
 """SSDP/UPnP discovery for Arcus hubs."""
 
 import socket
-import re
 
 SSDP_ADDR = "239.255.255.250"
 SSDP_PORT = 1900
