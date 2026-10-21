@@ -105,6 +105,6 @@ class FakeClient:
 def fake_hub(monkeypatch):
     """Route CLI commands to a FakeClient instead of a real hub."""
     client = FakeClient()
-    monkeypatch.setattr(cli_mod, "_resolve_host", lambda host, timeout=5.0: host)
+    monkeypatch.setattr(cli_mod, "_resolve_host", lambda host, **kwargs: host)
     monkeypatch.setattr(cli_mod, "_connect", lambda *a, **kw: client)
     return client
