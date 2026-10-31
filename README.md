@@ -27,6 +27,10 @@ Most commands accept a **host** argument that can be an IP address, hostname, or
 1. Checking a local cache (`~/.cache/arcushub/hosts.json`) with a quick reachability probe
 2. Checking the ARP table
 3. Running SSDP/UPnP discovery to find the hub on the network
+4. Recognising a hub seen before by the UUID it announces in discovery
+5. Asking each remaining hub that answered discovery for its MAC over SSH
+
+On macOS 27, Homebrew python (and so a default pipx install) gets an empty ARP table with no error. A hub then has to be identified over SSH once, after which step 4 recognises it even if SSH is closed or its IP changes. Known UUIDs are kept in `~/.cache/arcushub/hub_uuids.json`.
 
 Hub IDs are derived from the hub's MAC address using a base-23 encoding scheme. The tool knows the Arcus OUI (`00:16:A2`) and can convert in both directions.
 

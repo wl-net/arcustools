@@ -106,18 +106,24 @@ def _is_hub_id(value: str) -> bool:
     return bool(re.match(r"^[A-Za-z]{3}-\d{4}$", value))
 
 
-def _load_cache() -> dict:
-    if _CACHE_PATH.exists():
+def _load_cache(path: Path | None = None) -> dict:
+    path = path or _CACHE_PATH
+    if path.exists():
         try:
-            return json.loads(_CACHE_PATH.read_text())
+            return json.loads(path.read_text())
         except (json.JSONDecodeError, OSError):
             pass
     return {}
 
 
-def _save_cache(cache: dict) -> None:
-    _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _CACHE_PATH.write_text(json.dumps(cache))
+def _save_cache(cache: dict, path: Path | None = None) -> None:
+    path = path or _CACHE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache))
+
+
+def _hub_uuids_path() -> Path:
+    return _CACHE_PATH.with_name("hub_uuids.json")
 
 
 def _is_reachable(ip: str, port: int = 22, timeout: float = 1.0) -> bool:
@@ -200,6 +206,7 @@ def _find_in_arp(mac_even: str, mac_odd: str) -> str | None:
 # Hubs answer SSDP as "Iris OS/2.0 UPnP/1.0 Iris/2.0"; other UPnP devices on the
 # network (media renderers, routers) name themselves in the same header.
 _HUB_SSDP_SERVER = re.compile(r"iris|arcus", re.IGNORECASE)
+_USN_UUID = re.compile(r"uuid:([0-9a-f-]{36})", re.IGNORECASE)
 _MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$", re.IGNORECASE)
 
 
@@ -211,6 +218,35 @@ def _ssdp_hub_candidates(responses: list[dict]) -> list[str]:
         if ip and ip not in ips and _HUB_SSDP_SERVER.search(response.get("server", "")):
             ips.append(ip)
     return ips
+
+
+def _ssdp_hub_uuids(responses: list[dict]) -> dict[str, str]:
+    """Map the IP of each hub-like SSDP responder to the UUID in its USN header."""
+    uuids = {}
+    for response in responses:
+        match = _USN_UUID.match(response.get("usn", ""))
+        if match and response.get("_ip") in _ssdp_hub_candidates([response]):
+            uuids[response["_ip"]] = match.group(1).lower()
+    return uuids
+
+
+# The UUID a hub announces doesn't carry its hub ID, but it does outlive a DHCP
+# change: the agent derives it from the hub's certificate (IrisUpnpService). So
+# once a hub is identified, its UUID is enough to recognise it without ARP or SSH.
+def _known_hubs(responses: list[dict]) -> dict[str, str]:
+    """Map the IP of each responder announcing a UUID seen before to that hub's MAC."""
+    known = _load_cache(_hub_uuids_path())
+    return {ip: known[uuid] for ip, uuid in _ssdp_hub_uuids(responses).items() if uuid in known}
+
+
+def _remember_hubs(responses: list[dict], found: list[tuple[str, str]]) -> None:
+    """Record the announced UUID of each identified hub in found, [(ip, mac), ...]."""
+    uuids = _ssdp_hub_uuids(responses)
+    seen = {uuids[ip]: mac for ip, mac in found if ip in uuids}
+    if seen:
+        known = _load_cache(_hub_uuids_path())
+        known.update(seen)
+        _save_cache(known, _hub_uuids_path())
 
 
 def _parse_iface_macs(text: str) -> dict[str, str]:
@@ -226,10 +262,24 @@ def _parse_iface_macs(text: str) -> dict[str, str]:
     return macs
 
 
+_ARP_EMPTY_NOTE = (
+    "The system ARP table came back empty, so a hub not seen before can only be identified"
+    " over SSH. This happens on macOS 27 under Homebrew python, which pipx installs default"
+    " to. Once identified, a hub is recognised from then on by the UUID it announces."
+)
+
+
 def _unidentified_note(ips: list[str]) -> str:
     """Note for hub-like SSDP responders whose hub ID could not be read."""
-    return (f"Answered discovery but could not be identified ({', '.join(ips)}): "
-            "a hub ID is read over SSH, which these refused.")
+    return (f"{len(ips)} hub(s) answered discovery but could not be identified ({', '.join(ips)}): "
+            "a hub ID comes from the ARP table or SSH, and neither worked.")
+
+
+def _echo_unidentified(ips: list[str]) -> None:
+    """Report responders that could not be identified, and why if the ARP table is the cause."""
+    click.echo(_unidentified_note(ips))
+    if not _read_arp():
+        click.echo(_ARP_EMPTY_NOTE)
 
 
 def _identify_hub(ip: str, port: int = 22, user: str = "root",
@@ -394,14 +444,13 @@ def _resolve_host(host: str, timeout: float = 5.0, port: int = 22,
     1. Check local cache (~/.cache/arcushub/hosts.json) + quick TCP probe
     2. Check ARP table (instant, no network traffic)
     3. SSDP discovery (slow, populates ARP table) + check ARP again
-    4. Ask each hub that answered SSDP for its MAC over SSH
+    4. Recognise a hub seen before by the UUID it announced in SSDP
+    5. Ask each remaining hub that answered SSDP for its MAC over SSH
 
-    Step 4 exists because the ARP table is not always readable. macOS hands it
-    out only to binaries with Local Network access, and an ad-hoc-signed
-    interpreter (Homebrew python, and so pipx installs on top of it) gets an
-    empty table with no error -- every MAC lookup then comes up empty. Granting
-    the terminal app that access does not help: the check follows the
-    interpreter, which never appears in the Local Network list to be granted.
+    Steps 4 and 5 exist because the ARP table is not always readable. On macOS 27
+    Homebrew python (and so pipx installs on top of it) gets an empty table with
+    no error, and so does any child it spawns, which rules out shelling out to
+    a tool that could read it. Every MAC lookup then comes up empty.
     """
     if not _is_hub_id(host):
         return host
@@ -445,37 +494,52 @@ def _resolve_host(host: str, timeout: float = 5.0, port: int = 22,
     with _spinner("Running SSDP discovery"):
         responses = discover(timeout=timeout)
 
+    _remember_hubs(responses, _find_all_hubs_in_arp())
     ip = _find_in_arp(mac_even, mac_odd)
     if ip:
         cache[hub_id] = ip
         _save_cache(cache)
         return ip
 
-    # 4. Ask the hubs that answered discovery which hub they are
+    # 4. A hub seen before is recognised by the UUID it announced
+    known = _known_hubs(responses)
+    for candidate, mac in known.items():
+        if mac in (mac_even, mac_odd):
+            cache[hub_id] = candidate
+            _save_cache(cache)
+            return candidate
+
+    # 5. Ask the hubs that answered discovery which hub they are
     candidates = _ssdp_hub_candidates(responses)
     match = None
+    others, unidentified = [], []
     for candidate in candidates:
+        if candidate in known:
+            others.append(candidate)  # known to be some other hub, so no need to log in
+            continue
         with _spinner(f"Identifying hub at {candidate}"):
             identified = _identify_hub(candidate, port, user, password)
         if identified:
             cache[identified[0]] = candidate  # worth caching whoever answered
+            _remember_hubs(responses, [(candidate, identified[1])])
             if identified[0] == hub_id:
                 match = candidate
                 break
+            others.append(candidate)
+        else:
+            unidentified.append(candidate)
     _save_cache(cache)
     if match:
         return match
 
     msg = f"Hub {hub_id} not found on the network."
-    if candidates:
-        msg += f" {len(candidates)} hub(s) answered discovery ({', '.join(candidates)}), none of them this one."
+    if others:
+        msg += f" {len(others)} hub(s) answered discovery ({', '.join(others)}), none of them this one."
+    if unidentified:
+        # Any of these may be the hub we want; all we know is that we can't tell.
+        msg += f" {_unidentified_note(unidentified)}"
     if not _read_arp():
-        msg += (
-            "\nThe system ARP table came back empty, so hubs cannot be matched by MAC"
-            " (on macOS it is withheld from ad-hoc-signed interpreters, which is what"
-            " Homebrew python and pipx installs are). Hubs that accept SSH are still"
-            " found by the step above; for one that does not, pass its IP address."
-        )
+        msg += f"\n{_ARP_EMPTY_NOTE}\nYou can also pass the hub's IP address instead of its ID."
     raise click.ClickException(msg)
 
 
@@ -604,18 +668,25 @@ def hubs(timeout):
     found = _find_all_hubs_in_arp()
     unidentified = []
     if not found:
-        # No readable ARP table (see _resolve_host): ask the responders instead.
+        # No readable ARP table (see _resolve_host): recognise the hubs seen
+        # before and ask the rest.
+        known = _known_hubs(responses)
         for ip in _ssdp_hub_candidates(responses):
+            if ip in known:
+                found.append((ip, known[ip]))
+                continue
             with _spinner(f"Identifying hub at {ip}"):
                 identified = _identify_hub(ip)
             if identified:
                 found.append((ip, identified[1]))
             else:
                 unidentified.append(ip)
+    _remember_hubs(responses, found)
     if not found:
-        click.echo("No hubs found.")
         if unidentified:
-            click.echo(_unidentified_note(unidentified))
+            _echo_unidentified(unidentified)
+        else:
+            click.echo("No hubs found.")
         return
 
     cache = _load_cache()
@@ -644,7 +715,7 @@ def hubs(timeout):
         click.echo(f"{hub_id:<{id_w}}  {ip:<{ip_w}}  {mac}{note}")
     if unidentified:
         click.echo()
-        click.echo(_unidentified_note(unidentified))
+        _echo_unidentified(unidentified)
 
 
 @cli.command()
