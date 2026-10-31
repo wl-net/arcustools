@@ -22,6 +22,10 @@ def connect(host: str, port: int = 22, user: str = "root", password: str | None 
 
     With an explicit password, use only that. Otherwise try local SSH keys
     (installed by `arcushub setup-ssh-key`) first, then the known passwords.
+
+    The SSH agent is left out. paramiko signs with each agent key without first
+    asking the server whether it would accept it, so a Touch ID protected key
+    in the agent would prompt on every connection, for a key hubs don't have.
     """
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -29,7 +33,7 @@ def connect(host: str, port: int = 22, user: str = "root", password: str | None 
     last_err = None
     if not password:
         try:
-            client.connect(host, port=port, username=user, look_for_keys=True, allow_agent=True)
+            client.connect(host, port=port, username=user, look_for_keys=True, allow_agent=False)
             return client
         except paramiko.SSHException as e:
             # AuthenticationException, or "No authentication methods available" with no keys
