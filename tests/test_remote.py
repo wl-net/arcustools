@@ -5,7 +5,7 @@ import click
 import paramiko
 import pytest
 from click.testing import CliRunner
-from conftest import FakeClient
+from conftest import READABLE_FD, FakeClient
 
 from arcushub import cli as cli_mod
 from arcushub.cli import _download, _pump, _run, _upload, cli
@@ -116,9 +116,7 @@ def test_pump_returns_when_channel_closes_without_exit_status():
         closed = True
 
         def fileno(self):
-            r, w = os.pipe()
-            os.write(w, b"x")
-            return r
+            return READABLE_FD
 
         def recv_ready(self):
             return False

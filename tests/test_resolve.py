@@ -654,22 +654,22 @@ def test_commands_hand_their_connection_options_to_resolution(monkeypatch, comma
 
 def test_find_prints_only_the_ip_on_stdout(net):
     # `ip=$(arcushub find HUB)` has to work, however resolution got there
-    from click.testing import CliRunner
+    from conftest import separate_streams_runner
 
     net.responses = [ssdp(HUB_IP)]
     net.hubs = {HUB_IP: HUB_MAC}
 
-    result = CliRunner().invoke(cli_mod.cli, ["find", HUB_ID])
+    result = separate_streams_runner().invoke(cli_mod.cli, ["find", HUB_ID])
     assert result.stdout == f"{HUB_IP}\n"
 
 
 def test_status_output_is_not_animated_when_piped(net):
-    from click.testing import CliRunner
+    from conftest import separate_streams_runner
 
     net.responses = [ssdp(HUB_IP)]
     net.hubs = {HUB_IP: HUB_MAC}
 
-    result = CliRunner().invoke(cli_mod.cli, ["find", HUB_ID])
+    result = separate_streams_runner().invoke(cli_mod.cli, ["find", HUB_ID])
     assert "✔ Running SSDP discovery" in result.stderr
     assert "\r" not in result.stderr and "⠋" not in result.stderr
 

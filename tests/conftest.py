@@ -2,8 +2,30 @@ import os
 import subprocess
 
 import pytest
+from click.testing import CliRunner
 
 from arcushub import cli as cli_mod
+
+
+def _always_readable_fd():
+    r, w = os.pipe()
+    os.write(w, b"x")
+    os.close(w)
+    return r
+
+
+# Shared so that select() in _pump returns immediately without costing a pipe per
+# channel. The agent restart polls open channels for as long as their timeout lasts,
+# so a pipe each is unbounded on a fast machine, and select() rejects fds from 1024 up.
+READABLE_FD = _always_readable_fd()
+
+
+def separate_streams_runner():
+    """A CliRunner whose result keeps stdout and stderr apart, on either click API."""
+    try:
+        return CliRunner(mix_stderr=False)  # click 8.1, the last for Python 3.9
+    except TypeError:
+        return CliRunner()  # click 8.2 removed the option and always separates them
 
 
 class FakeChannel:
@@ -14,13 +36,9 @@ class FakeChannel:
         self.closed = False
         self._done = False
         self._sent = 0
-        # Always-readable fd so select() in _pump returns immediately
-        r, w = os.pipe()
-        os.write(w, b"x")
-        self._fd = r
 
     def fileno(self):
-        return self._fd
+        return READABLE_FD
 
     def exec_command(self, cmd):
         self._proc = subprocess.Popen(["sh", "-c", cmd], stdin=subprocess.PIPE,
