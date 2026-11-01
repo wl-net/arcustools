@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import select
 import struct
 import sys
 import termios
 import tty
+from pathlib import Path
 
 import paramiko
 
@@ -15,6 +17,43 @@ ROOT_PASSWORDS = [
     r"zm{[*f6gB5X($]R9",   # hubOS 3.x releases
     r"kz58!~Eb.RZ?+bqb",   # hubOS 2.x releases
 ]
+
+
+_KEYS_PATH = Path.home() / ".cache" / "arcushub" / "ssh_keys.json"
+
+
+def _installed_keys() -> list[str]:
+    """Key files setup-ssh-key was pointed at, which look_for_keys wouldn't find by name."""
+    try:
+        keys = json.loads(_KEYS_PATH.read_text())
+    except (OSError, ValueError):
+        return []
+    return [key for key in keys if Path(key).exists()]
+
+
+def remember_key(key_file: Path) -> None:
+    """Offer this private key on every login from now on."""
+    keys = _installed_keys()
+    if str(key_file) not in keys:
+        _KEYS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _KEYS_PATH.write_text(json.dumps(keys + [str(key_file)]))
+
+
+def _login(host: str, port: int, user: str, **auth) -> paramiko.SSHClient:
+    """Make one login attempt on a client of its own.
+
+    Connecting a client again drops its old transport without closing it, which
+    would leave each failed attempt open until we exit. Hubs run dropbear, which
+    by default refuses a sixth unauthenticated connection from one IP.
+    """
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(host, port=port, username=user, allow_agent=False, **auth)
+    except Exception:
+        client.close()
+        raise
+    return client
 
 
 def connect(host: str, port: int = 22, user: str = "root", password: str | None = None) -> paramiko.SSHClient:
@@ -27,14 +66,10 @@ def connect(host: str, port: int = 22, user: str = "root", password: str | None 
     asking the server whether it would accept it, so a Touch ID protected key
     in the agent would prompt on every connection, for a key hubs don't have.
     """
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
     last_err = None
     if not password:
         try:
-            client.connect(host, port=port, username=user, look_for_keys=True, allow_agent=False)
-            return client
+            return _login(host, port, user, key_filename=_installed_keys() or None, look_for_keys=True)
         except paramiko.SSHException as e:
             # AuthenticationException, or "No authentication methods available" with no keys
             last_err = e
@@ -42,17 +77,24 @@ def connect(host: str, port: int = 22, user: str = "root", password: str | None 
     passwords = [password] if password else ROOT_PASSWORDS
     for pw in passwords:
         try:
-            client.connect(
-                host, port=port, username=user, password=pw,
-                look_for_keys=False, allow_agent=False,
+            return _login(
+                host, port, user, password=pw, look_for_keys=False,
                 disabled_algorithms={"keys": [], "pubkeys": []},
             )
-            return client
         except paramiko.AuthenticationException as e:
             last_err = e
-            continue
 
     raise paramiko.AuthenticationException(f"All passwords failed for {user}@{host}:{port}") from last_err
+
+
+def key_login_works(host: str, port: int, user: str, key_file: Path) -> bool:
+    """Try a login with this key file alone."""
+    try:
+        client = _login(host, port, user, key_filename=str(key_file), look_for_keys=False)
+    except (paramiko.SSHException, OSError):
+        return False
+    client.close()
+    return True
 
 
 def interactive_shell(client: paramiko.SSHClient) -> None:

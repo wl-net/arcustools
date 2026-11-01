@@ -10,7 +10,8 @@ import socket
 import subprocess
 import sys
 import threading
-from contextlib import contextmanager
+import time
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 import click
@@ -61,21 +62,28 @@ class _CountingWriter:
 
 @contextmanager
 def _spinner(message: str, progress: _Progress | None = None):
-    """Show a braille spinner with a message while work runs in the block."""
+    """Show a braille spinner with a message while work runs in the block.
+
+    Status goes to stderr, so stdout carries only a command's result. Unless stderr
+    is a terminal there's no animation, just one line when the work is done.
+    """
     stop = threading.Event()
     failed = threading.Event()
+    animate = sys.stderr.isatty()
+    clear = "\r\033[K" if animate else ""
 
     def spin():
         i = 0
-        while not stop.is_set():
+        while animate and not stop.is_set():
             frame = _SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]
             suffix = f"  {progress.status()}" if progress else ""
-            click.echo(f"\r\033[K{frame} {message}{suffix}", nl=False)
+            click.echo(f"{clear}{frame} {message}{suffix}", nl=False, err=True)
             i += 1
             stop.wait(0.08)
+        stop.wait()
         suffix = f"  {progress.status()}" if progress else ""
         mark = "✘" if failed.is_set() else "✔"
-        click.echo(f"\r\033[K{mark} {message}{suffix}")
+        click.echo(f"{clear}{mark} {message}{suffix}", err=True)
 
     t = threading.Thread(target=spin, daemon=True)
     t.start()
@@ -135,6 +143,21 @@ def _is_reachable(ip: str, port: int = 22, timeout: float = 1.0) -> bool:
         return False
 
 
+def _answers(ip: str, port: int = 22, timeout: float = 2.5) -> bool:
+    """Is a host up at ip? A refused connection counts: it took a live host to refuse.
+
+    Hubs with SSH closed take macOS just over a second to report as refused, so
+    the timeout has to be longer than _is_reachable's to see that answer at all.
+    """
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except ConnectionRefusedError:
+        return True
+    except OSError:
+        return False
+
+
 _ATF_COM = 0x2  # /proc/net/arp flag: entry is complete (resolved)
 
 
@@ -176,7 +199,7 @@ def _read_arp() -> list[tuple[str, str]]:
     except OSError:
         pass
     try:
-        result = subprocess.run(["arp", "-a"], capture_output=True, text=True, check=False)
+        result = subprocess.run(["arp", "-an"], capture_output=True, text=True, check=False)
     except FileNotFoundError:
         return []
     return _parse_arp_a(result.stdout)
@@ -200,6 +223,19 @@ def _find_in_arp(mac_even: str, mac_odd: str) -> str | None:
     for ip, mac in _read_arp():
         if mac in (mac_even, mac_odd):
             return ip
+    return None
+
+
+def _find_live_in_arp(mac_even: str, mac_odd: str, port: int = 22) -> str | None:
+    """Find a MAC in the ARP table, as long as that entry is still current.
+
+    An entry can outlive a DHCP change. Traffic to its IP goes to the MAC on
+    record, so an answer means the pairing holds, unless the probe made the
+    kernel relearn the entry, which is why the table is read again.
+    """
+    ip = _find_in_arp(mac_even, mac_odd)
+    if ip and _answers(ip, port) and _find_in_arp(mac_even, mac_odd) == ip:
+        return ip
     return None
 
 
@@ -249,6 +285,19 @@ def _remember_hubs(responses: list[dict], found: list[tuple[str, str]]) -> None:
         _save_cache(known, _hub_uuids_path())
 
 
+def _remember_arp_hubs(responses: list[dict], port: int = 22) -> None:
+    """Record hubs the ARP table can name, once their entries prove current.
+
+    What's saved here is used long after the table may have stopped being readable,
+    so a stale entry would mean recognising one hub as another with nothing to catch it.
+    """
+    uuids = _ssdp_hub_uuids(responses)
+    known = _known_hubs(responses)
+    unconfirmed = {ip for ip, mac in _find_all_hubs_in_arp() if ip in uuids and known.get(ip) != mac}
+    live = {ip for ip in unconfirmed if _answers(ip, port)}
+    _remember_hubs(responses, [(ip, mac) for ip, mac in _find_all_hubs_in_arp() if ip in live])
+
+
 def _parse_iface_macs(text: str) -> dict[str, str]:
     """Parse `<path>/<iface>/address <mac>` lines into {iface: mac}, skipping junk."""
     macs = {}
@@ -282,6 +331,9 @@ def _echo_unidentified(ips: list[str]) -> None:
         click.echo(_ARP_EMPTY_NOTE)
 
 
+_IDENTIFY_TIMEOUT = 10.0  # seconds a logged-in hub gets to report its MACs
+
+
 def _identify_hub(ip: str, port: int = 22, user: str = "root",
                   password: str | None = None) -> tuple[str, str] | None:
     """Ask the host at ip for its MAC over SSH. Returns (hub_id, mac), or None.
@@ -298,11 +350,17 @@ def _identify_hub(ip: str, port: int = 22, user: str = "root",
         client = connect(ip, port=port, user=user, password=password)
     except Exception:
         return None
+    # A hub that drops off mid-probe never closes the channel, and nothing below
+    # has a timeout of its own. Closing the client ends every wait it could be in.
+    deadline = threading.Timer(_IDENTIFY_TIMEOUT, client.close)
+    deadline.daemon = True
+    deadline.start()
     try:
         out = _run(client, "for f in /sys/class/net/*/address; do echo $f $(cat $f); done", check=False)
     except Exception:
         return None  # a hub that drops mid-probe shouldn't stop us asking the next one
     finally:
+        deadline.cancel()
         client.close()
 
     oui_prefixes = _arcus_oui_prefixes()
@@ -415,7 +473,9 @@ def _upload(client, fileobj, size: int, remote_path: str, label: str) -> None:
                     f"Upload to {remote_path} incomplete: {remote_size or '?'} of {size} bytes written"
                 )
     except click.ClickException:
-        _run(client, f"rm -f {quoted}", check=False)
+        # The connection may be what failed, and that error is the one to report
+        with suppress(Exception):
+            _run(client, f"rm -f {quoted}", check=False)
         raise
 
 
@@ -442,12 +502,12 @@ def _resolve_host(host: str, timeout: float = 5.0, port: int = 22,
 
     Resolution order:
     1. Check local cache (~/.cache/arcushub/hosts.json) + quick TCP probe
-    2. Check ARP table (instant, no network traffic)
+    2. Check ARP table, and that the entry is still current
     3. SSDP discovery (slow, populates ARP table) + check ARP again
-    4. Recognise a hub seen before by the UUID it announced in SSDP
-    5. Ask each remaining hub that answered SSDP for its MAC over SSH
+    4. Ask the hubs that answered SSDP for their MAC over SSH, falling back on
+       the UUID a hub announced if it was seen before and SSH can't settle it
 
-    Steps 4 and 5 exist because the ARP table is not always readable. On macOS 27
+    Step 4 exists because the ARP table is not always readable. On macOS 27
     Homebrew python (and so pipx installs on top of it) gets an empty table with
     no error, and so does any child it spawns, which rules out shelling out to
     a tool that could read it. Every MAC lookup then comes up empty.
@@ -468,23 +528,24 @@ def _resolve_host(host: str, timeout: float = 5.0, port: int = 22,
     mac_odd = ":".join(f"{b:02x}" for b in mac_bytes[:-1]) + f":{mac_bytes[-1] | 1:02x}"
 
     # 1. Check cache. DHCP may have handed the cached IP to a different hub
-    # since, so confirm it is still this one: by MAC when the ARP table is
-    # readable (the probe above refreshes the entry), else by asking the host.
+    # since, so confirm it is still this one: by MAC if the ARP table has that IP
+    # (the probe above refreshes the entry), else by asking the host. The table
+    # may be unreadable, or have no entry because the hub is behind a router.
     cache = _load_cache()
     cached_ip = cache.get(hub_id)
-    if cached_ip and _is_reachable(cached_ip):
-        if _read_arp():
-            if _find_in_arp(mac_even, mac_odd) == cached_ip:
-                return cached_ip
-        else:
+    if cached_ip and _is_reachable(cached_ip, port=port):
+        cached_mac = dict(_read_arp()).get(cached_ip)
+        if cached_mac in (mac_even, mac_odd):
+            return cached_ip
+        if cached_mac is None:
             identified = _identify_hub(cached_ip, port, user, password)
             if identified and identified[0] == hub_id:
                 return cached_ip
 
-    click.echo(f"Resolving {hub_id} (MAC {mac_even} or {mac_odd})...")
+    click.echo(f"Resolving {hub_id} (MAC {mac_even} or {mac_odd})...", err=True)
 
     # 2. Check ARP table (already populated from recent traffic)
-    ip = _find_in_arp(mac_even, mac_odd)
+    ip = _find_live_in_arp(mac_even, mac_odd, port)
     if ip:
         cache[hub_id] = ip
         _save_cache(cache)
@@ -494,29 +555,27 @@ def _resolve_host(host: str, timeout: float = 5.0, port: int = 22,
     with _spinner("Running SSDP discovery"):
         responses = discover(timeout=timeout)
 
-    _remember_hubs(responses, _find_all_hubs_in_arp())
-    ip = _find_in_arp(mac_even, mac_odd)
+    _remember_arp_hubs(responses, port)
+    ip = _find_live_in_arp(mac_even, mac_odd, port)
     if ip:
         cache[hub_id] = ip
         _save_cache(cache)
         return ip
 
-    # 4. A hub seen before is recognised by the UUID it announced
+    # 4. Ask the hubs that answered which hub they are. A remembered UUID says who
+    # to ask first: a hub believed to be this one, then strangers, then hubs believed
+    # to be another, who only matter if that belief is wrong. SSH overrules a UUID,
+    # which can't be checked any other way, but with SSH closed it's all there is.
     known = _known_hubs(responses)
-    for candidate, mac in known.items():
-        if mac in (mac_even, mac_odd):
-            cache[hub_id] = candidate
-            _save_cache(cache)
-            return candidate
 
-    # 5. Ask the hubs that answered discovery which hub they are
-    candidates = _ssdp_hub_candidates(responses)
+    def rank(ip):
+        if ip not in known:
+            return 1
+        return 0 if known[ip] in (mac_even, mac_odd) else 2
+
     match = None
     others, unidentified = [], []
-    for candidate in candidates:
-        if candidate in known:
-            others.append(candidate)  # known to be some other hub, so no need to log in
-            continue
+    for candidate in sorted(_ssdp_hub_candidates(responses), key=rank):
         with _spinner(f"Identifying hub at {candidate}"):
             identified = _identify_hub(candidate, port, user, password)
         if identified:
@@ -525,6 +584,12 @@ def _resolve_host(host: str, timeout: float = 5.0, port: int = 22,
             if identified[0] == hub_id:
                 match = candidate
                 break
+            others.append(candidate)
+        elif rank(candidate) == 0:
+            cache[hub_id] = candidate
+            match = candidate
+            break
+        elif candidate in known:
             others.append(candidate)
         else:
             unidentified.append(candidate)
@@ -617,6 +682,9 @@ def enable_dropbear(host, port, user, password):
               help="Path to SSH public key file (default: auto-detect).")
 def setup_ssh_key(host, port, user, password, key):
     """Push an SSH public key to a hub for passwordless login. HOST can be an IP, hostname, or hub ID."""
+    from .ssh import key_login_works, remember_key
+
+    chosen = key is not None  # the auto-detected names are ones logins already try
     if key is None:
         ssh_dir = Path.home() / ".ssh"
         for name in ("id_ed25519.pub", "id_rsa.pub"):
@@ -632,32 +700,54 @@ def setup_ssh_key(host, port, user, password, key):
     key_content = key.read_text().strip()
     click.echo(f"Using key: {key}")
 
-    with _hub_session(host, port, user, password) as client:
+    private_key = key.with_suffix("").resolve()
+    ip = _resolve_host(host, port=port, user=user, password=password)
+    with _hub_session(ip, port, user, password) as client:
         auth_keys = "/data/config/dropbear/authorized_keys"
         quoted_key = shlex.quote(key_content)
+        # Logins read this copy, which the hub otherwise only makes at boot
+        publish = f"cp {auth_keys} /var/run/authorized_keys && chmod 600 /var/run/authorized_keys"
         # Print a marker only when appending, so re-running doesn't duplicate the key
         cmd = (
             f"mkdir -p /data/config/dropbear && touch {auth_keys} && "
-            f"(grep -qxF {quoted_key} {auth_keys} || (echo {quoted_key} >> {auth_keys} && echo added))"
+            f"(grep -qxF {quoted_key} {auth_keys} || (echo {quoted_key} >> {auth_keys} && echo added)) && "
+            f"{publish}"
         )
-        if _run(client, cmd).strip() == "added":
-            click.echo("SSH key installed. You can now connect without a password.")
-        else:
-            click.echo("SSH key already installed.")
+        added = _run(client, cmd).strip() == "added"
+
+        if not key_login_works(ip, port, user, private_key):
+            # A hub with SSH enabled and any key at all goes key-only, so leaving
+            # one that doesn't work would lock out every password login.
+            if added:
+                _run(client, f"grep -vxF {quoted_key} {auth_keys} > {auth_keys}.new; "
+                             f"mv -f {auth_keys}.new {auth_keys} && {publish}")
+            undone = ", so the key was taken back off the hub" if added else ""
+            raise click.ClickException(
+                f"Logging in with {private_key} failed{undone}."
+                " arcushub needs an unencrypted key file, because it doesn't use the SSH agent."
+            )
+    if chosen:
+        remember_key(private_key)
+    if added:
+        click.echo("SSH key installed. You can now connect without a password.")
+    else:
+        click.echo("SSH key already installed.")
 
 
 @cli.command()
 @click.argument("hub_id")
 @click.option("--timeout", "-t", default=5.0, help="SSDP discovery timeout in seconds.")
-def find(hub_id, timeout):
+@_hub_options
+def find(hub_id, timeout, port, user, password):
     """Find a hub's IP address on the local network by its hub ID."""
-    ip = _resolve_host(hub_id, timeout=timeout)
+    ip = _resolve_host(hub_id, timeout=timeout, port=port, user=user, password=password)
     click.echo(ip)
 
 
 @cli.command()
 @click.option("--timeout", "-t", default=5.0, help="SSDP discovery timeout in seconds.")
-def hubs(timeout):
+@_hub_options
+def hubs(timeout, port, user, password):
     """Discover all Arcus hubs on the local network."""
     from .hubid import mac_to_hub_id
     from .ssdp import discover
@@ -665,23 +755,29 @@ def hubs(timeout):
     with _spinner("Running SSDP discovery"):
         responses = discover(timeout=timeout)
 
+    _remember_arp_hubs(responses, port)
     found = _find_all_hubs_in_arp()
+    in_arp = {ip for ip, _ in found}
+    known = _known_hubs(responses)
     unidentified = []
-    if not found:
-        # No readable ARP table (see _resolve_host): recognise the hubs seen
-        # before and ask the rest.
-        known = _known_hubs(responses)
-        for ip in _ssdp_hub_candidates(responses):
-            if ip in known:
-                found.append((ip, known[ip]))
-                continue
-            with _spinner(f"Identifying hub at {ip}"):
-                identified = _identify_hub(ip)
-            if identified:
-                found.append((ip, identified[1]))
-            else:
-                unidentified.append(ip)
-    _remember_hubs(responses, found)
+    # The ARP table can't name every hub that answered: it may be unreadable (see
+    # _resolve_host), or just not list them all. Recognise the hubs seen before
+    # and ask the rest.
+    for ip in _ssdp_hub_candidates(responses):
+        if ip in in_arp:
+            continue
+        if ip in known:
+            found.append((ip, known[ip]))
+            continue
+        with _spinner(f"Identifying hub at {ip}"):
+            identified = _identify_hub(ip, port, user, password)
+        if identified:
+            found.append((ip, identified[1]))
+            _remember_hubs(responses, [(ip, identified[1])])
+        else:
+            unidentified.append(ip)
+    # A hub in the table at an old IP and answering at a new one is one hub, at the new IP
+    found = list({mac: (ip, mac) for ip, mac in found}.values())
     if not found:
         if unidentified:
             _echo_unidentified(unidentified)
@@ -723,7 +819,7 @@ def hubs(timeout):
 @_hub_options
 def ping(host, port, user, password):
     """Ping a hub and show basic status. HOST can be an IP, hostname, or hub ID."""
-    host = _resolve_host(host)
+    host = _resolve_host(host, port=port, user=user, password=password)
 
     # ICMP ping
     click.echo(f"Pinging {host}...")
@@ -764,7 +860,7 @@ def ping(host, port, user, password):
         if uptime:
             click.echo(f"  Uptime: {uptime}")
 
-        # The agent is the hub's only JVM (agent_stop just does `killall java`)
+        # The agent is the hub's only JVM
         agent_pid = _run(client, "pidof java", check=False).strip()
         click.echo(f"  Hub agent: {'running (pid ' + agent_pid.split()[0] + ')' if agent_pid else 'not running'}")
     finally:
@@ -786,14 +882,108 @@ def agent():
     """Hub agent management commands."""
 
 
+_AGENT_LIBS_DIR = "/data/agent/libs"
+_JAR_STAGING_DIR = "/data/agent/libs.new"
+_JAR_BACKUP_DIR = "/data/agent/libs.old"
+_AGENT_JSA = "/data/agent/agent.jsa"
+_AGENT_RESTART_TIMEOUT = 30.0
+
+# irisagentd supervises the agent, restarting it the moment it exits, so `killall
+# java` is how to restart it; irisinitd does the same. Avoid agent_stop, which kills
+# the supervisor too, and agent_start, whose replacement didn't outlive the SSH
+# session on a real hub and lacks the memory limits this script sets for it.
+_SUPERVISOR_START = "/etc/init.d/irisagent </dev/null >/dev/null 2>&1"
+_AGENT_RESTART = f"killall java; pidof irisagentd >/dev/null || {_SUPERVISOR_START}"
+
+
+def _restart_agent(client) -> None:
+    """Restart the agent, and wait for a new one to be running."""
+    before = _run(client, "pidof java", check=False).split()
+    with _spinner("Restarting agent"):
+        _run(client, _AGENT_RESTART)
+        deadline = time.monotonic() + _AGENT_RESTART_TIMEOUT
+        while True:
+            running = _run(client, "pidof java", check=False).split()
+            if running and running != before:
+                return
+            if time.monotonic() > deadline:
+                raise click.ClickException(
+                    f"No new agent after {_AGENT_RESTART_TIMEOUT:.0f}s. See /tmp/hubAgent.log on the hub."
+                )
+            time.sleep(0.5)
+
+
+def _hub_jars(client) -> dict[str, str]:
+    """The jars in the agent's libs directory, as {name: md5}."""
+    output = _run(client, f"md5sum {_AGENT_LIBS_DIR}/*.jar 2>/dev/null", check=False)
+    jars = {}
+    # md5sum lines look like "<hash>  /data/agent/libs/foo.jar"
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].endswith(".jar"):
+            jars[parts[1].rsplit("/", 1)[-1]] = parts[0]
+    return jars
+
+
+def _jar_artifact(name: str) -> str:
+    """A jar's name without its version: foo-bar-2.13.29-SNAPSHOT.jar is foo-bar."""
+    return re.sub(r"-\d[\w.]*(-SNAPSHOT)?\.jar$", "", name)
+
+
+def _other_versions(names, jars) -> list[str]:
+    """The jars that are other versions of these names."""
+    artifacts = {_jar_artifact(name) for name in names}
+    return sorted(jar for jar in jars if jar not in names and _jar_artifact(jar) in artifacts)
+
+
+def _stage_jars(client, jars) -> None:
+    """Upload (name, data) pairs to a staging directory and check they arrived intact.
+
+    The agent stays up meanwhile, so it keeps feeding the hardware watchdog and a
+    failed upload changes nothing. The directory is beside libs, not in it, because
+    the launch script puts every file in libs on the classpath.
+    """
+    _run(client, f"rm -rf {_JAR_STAGING_DIR} && mkdir -p {_JAR_STAGING_DIR}")
+    try:
+        for name, data in jars:
+            remote_path = f"{_JAR_STAGING_DIR}/{name}"
+            _upload(client, io.BytesIO(data), len(data), remote_path, f"Uploading {name}")
+            digest = _run(client, f"md5sum {shlex.quote(remote_path)}").split()[0]
+            if digest != hashlib.md5(data).hexdigest():
+                raise click.ClickException(f"{name} arrived corrupted: md5 {digest} on the hub")
+    except click.ClickException:
+        with suppress(Exception):
+            _run(client, f"rm -rf {_JAR_STAGING_DIR}", check=False)
+        raise
+
+
+def _swap_in_jars(client, names, remove=(), backup=()) -> None:
+    """Move staged jars into libs, take out `remove`, and copy `backup` aside first.
+
+    This must come before a restart, since irisagentd starts the next agent as soon
+    as the last one dies. It's safe with the agent running: renaming over a jar leaves
+    it with the old file still open. The shared class archive is built from the old
+    jars and has to go too, or the next start fails on it before rebuilding it.
+    """
+    libs = [shlex.quote(f"{_AGENT_LIBS_DIR}/{name}") for name in backup]
+    steps = [f"mkdir -p {_JAR_BACKUP_DIR}", f"cp -a {' '.join(libs)} {_JAR_BACKUP_DIR}/"] if libs else []
+    if names:
+        staged = " ".join(shlex.quote(f"{_JAR_STAGING_DIR}/{name}") for name in names)
+        steps.append(f"mv -f {staged} {_AGENT_LIBS_DIR}/")
+    if remove:
+        steps.append("rm -f " + " ".join(shlex.quote(f"{_AGENT_LIBS_DIR}/{name}") for name in remove))
+    steps += [f"chown agent:agent {_AGENT_LIBS_DIR}/*.jar", f"rm -f {_AGENT_JSA}", f"rmdir {_JAR_STAGING_DIR}"]
+    with _spinner("Swapping in jars"):
+        _run(client, " && ".join(steps))
+
+
 @agent.command()
 @click.argument("host")
 @_hub_options
 def restart(host, port, user, password):
     """Restart the hub agent. HOST can be an IP address, hostname, or hub ID."""
     with _hub_session(host, port, user, password) as client:
-        with _spinner("Restarting agent"):
-            _run(client, "/home/root/bin/agent_stop && /home/root/bin/agent_start")
+        _restart_agent(client)
         click.echo(f"Agent restarted on {host}.")
 
 
@@ -882,13 +1072,14 @@ def test(host, tarfile, port, user, password):
         with open(tarfile, "rb") as f:
             _upload(client, f, tarfile.stat().st_size, tmp_path, f"Uploading {tarfile} → {tmp_path}")
 
+        # The supervisor has to go too, or it would start the agent mid-extract
         install_cmd = (
-            "killall java; "
+            "/home/root/bin/agent_stop; "
             "cd /data/agent && "
             "rm -rf lib bin conf libs && rm -f * && "
             f"tar xf {tmp_path} && "
             "chown -R agent . && chgrp -R agent . && "
-            "/home/root/bin/agent_start"
+            f"{_SUPERVISOR_START}"
         )
         with _spinner("Stopping agent, extracting, and restarting"):
             _run(client, install_cmd)
@@ -945,14 +1136,7 @@ def update(host, port, user, password, dist, upload_all):
 
     with _hub_session(host, port, user, password) as client:
         with _spinner("Hashing hub jars"):
-            output = _run(client, "md5sum /data/agent/libs/*.jar 2>/dev/null", check=False)
-
-        # md5sum lines look like "<hash>  /data/agent/libs/foo.jar"
-        remote_jars = {}
-        for line in output.splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[1].endswith(".jar"):
-                remote_jars[parts[1].rsplit("/", 1)[-1]] = parts[0]
+            remote_jars = _hub_jars(client)
 
         # Determine which jars need updating
         if upload_all:
@@ -970,22 +1154,85 @@ def update(host, port, user, password, dist, upload_all):
             marker = "~" if jar_name in remote_jars else "+"
             click.echo(f"  {marker} {jar_name} ({_format_size(local_jars[jar_name][1])})")
 
-        # Stop the agent before uploading; killall exits nonzero when java isn't running
-        with _spinner("Stopping agent"):
-            _run(client, "killall java", check=False)
+        # Leftovers of an older build, not jars the tarball also ships
+        outdated = _other_versions(changed, set(remote_jars) - set(local_jars))
+        for jar_name in outdated:
+            click.echo(f"  - {jar_name}")
 
-        # Extract and upload changed jars
         with tarfile_mod.open(tarball, "r:gz") as tf:
-            for jar_name in changed:
-                jar_data = tf.extractfile(tf.getmember(f"libs/{jar_name}")).read()
-                remote_path = f"/data/agent/libs/{jar_name}"
-                _upload(client, io.BytesIO(jar_data), len(jar_data), remote_path, f"Uploading {jar_name}")
-
-        # Fix ownership and restart
-        with _spinner("Restarting agent"):
-            _run(client, "chown agent:agent /data/agent/libs/*.jar && /home/root/bin/agent_start")
+            _stage_jars(client, ((name, tf.extractfile(tf.getmember(f"libs/{name}")).read()) for name in changed))
+        _swap_in_jars(client, changed, remove=outdated)
+        _restart_agent(client)
 
         click.echo(f"Updated {len(changed)} jar{'s' if len(changed) != 1 else ''} on {host}.")
+
+
+@agent.command()
+@click.argument("host")
+@click.argument("jars", nargs=-1, required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@_hub_options
+@click.option("--replace", multiple=True, metavar="JAR",
+              help="Jar on the hub to replace, when it isn't another version of the same name. Repeatable.")
+@click.option("--no-restart", is_flag=True, help="Leave the new jars for the next restart.")
+@click.option("--dry-run", is_flag=True, help="Show what would change without changing anything.")
+def push(host, jars, port, user, password, replace, no_restart, dry_run):
+    """Install locally built jars on a hub and restart the agent.
+
+    Uploads with the agent running and checks each jar's MD5, so a failed push
+    changes nothing. Then swaps the jars in, replacing any other version of the
+    same jar, and restarts the agent. Replaced jars are kept in /data/agent/libs.old.
+
+    HOST can be an IP, hostname, or hub ID.
+
+    \b
+    Examples:
+      arcushub agent push LWR-2389 build/libs/arcus-zigbee-controller-2.13.29-SNAPSHOT.jar
+      arcushub agent push LWR-2389 zigbee.jar zwave.jar --dry-run
+      arcushub agent push LWR-2389 new.jar --replace old-2.13.25.jar --no-restart
+    """
+    local_jars = {path.name: path.read_bytes() for path in jars}
+    digests = {name: hashlib.md5(data).hexdigest() for name, data in local_jars.items()}
+
+    with _hub_session(host, port, user, password) as client:
+        with _spinner("Hashing hub jars"):
+            remote_jars = _hub_jars(client)
+
+        missing = [jar for jar in replace if jar not in remote_jars]
+        if missing:
+            raise click.ClickException(f"Not on the hub, so can't be replaced: {', '.join(missing)}")
+        outdated = [jar for jar in replace if jar not in local_jars]
+        if not replace:
+            outdated = _other_versions(local_jars, remote_jars)
+            artifacts = [_jar_artifact(jar) for jar in outdated]
+            clashes = sorted({jar for jar in outdated if artifacts.count(_jar_artifact(jar)) > 1})
+            if clashes:
+                raise click.ClickException(
+                    f"Several jars on the hub could be the one to replace: {', '.join(clashes)}. Use --replace."
+                )
+
+        changed = [name for name in local_jars if remote_jars.get(name) != digests[name]]
+        if not changed and not outdated:
+            click.echo("Those jars are already on the hub.")
+            return
+
+        for name in changed:
+            marker = "~" if name in remote_jars else "+"
+            click.echo(f"  {marker} {name} ({_format_size(len(local_jars[name]))}, md5 {digests[name][:8]})")
+        for name in outdated:
+            click.echo(f"  - {name}")
+
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+
+        _stage_jars(client, ((name, local_jars[name]) for name in changed))
+        backup = [name for name in changed if name in remote_jars] + outdated
+        _swap_in_jars(client, changed, remove=outdated, backup=backup)
+        if no_restart:
+            click.echo(f"Jars installed on {host}. They'll load the next time the agent restarts.")
+            return
+        _restart_agent(client)
+        click.echo(f"Jars installed on {host} and agent restarted.")
 
 
 @agent.command()
@@ -1090,12 +1337,31 @@ def scp(src, dst, port, user, password):
                 dst_path = dst_path.rstrip("/") + "/" + Path(src_path).name
 
             # Verify remote directory exists before transferring
-            remote_dir = dst_path.rsplit("/", 1)[0] if "/" in dst_path else "."
+            remote_dir = (dst_path.rsplit("/", 1)[0] or "/") if "/" in dst_path else "."
             if _run(client, f"test -d {shlex.quote(remote_dir)} && echo dir", check=False).strip() != "dir":
                 raise click.ClickException(f"Remote directory does not exist: {remote_dir}")
 
             with open(src_path, "rb") as f:
                 _upload(client, f, Path(src_path).stat().st_size, dst_path, f"Uploading {src_path} → {dst_path}")
+
+
+def _stop_agent_for_flash(client):
+    """Stop the agent to free memory. Returns the channel feeding the watchdog in its place.
+
+    validate_image/fwinstall stage the decrypted image in /tmp, which is RAM;
+    with the Java agent also resident, the hub runs out of memory. The hub
+    reboots after flashing anyway, so stop the agent up front.
+
+    On release images only the agent feeds the hardware watchdog (300s on V2 hubs,
+    120s on V3), and it leaves it armed when it exits. validate_image doesn't poke
+    it (fwinstall does), so feed it ourselves until the install finishes. Capped
+    at 30 minutes in case we lose the connection.
+    """
+    with _spinner("Stopping agent to free memory"):
+        _run(client, "/home/root/bin/agent_stop", check=False)
+    feeder = client.get_transport().open_session()
+    feeder.exec_command("i=0; while [ $i -lt 30 ]; do echo A > /dev/watchdog0; i=$((i+1)); sleep 60; done")
+    return feeder
 
 
 @cli.command()
@@ -1119,8 +1385,10 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
         remote_dir = "/data/iris/data/tmp"
         result = _run(client, f"mkdir -p {remote_dir} && chown agent:agent {remote_dir} 2>/dev/null && echo ok",
                       check=False)
+        feeder = None
         if result.strip() != "ok":
             remote_dir = "/tmp"
+            feeder = _stop_agent_for_flash(client)  # the image itself will be in RAM
         remote_path = f"{remote_dir}/hubOS.bin"
 
         # Upload firmware via exec channel (hub SSH lacks SFTP)
@@ -1145,17 +1413,8 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
             cmd_parts.append(remote_path)
         cmd = " ".join(cmd_parts)
 
-        # validate_image/fwinstall stage the decrypted image in /tmp, which is RAM;
-        # with the Java agent also resident, the hub runs out of memory. The hub
-        # reboots after flashing anyway, so stop the agent up front.
-        with _spinner("Stopping agent to free memory"):
-            _run(client, "/home/root/bin/agent_stop", check=False)
-        # On release images only the agent feeds the 300s hardware watchdog, and it
-        # leaves it armed when it exits. validate_image doesn't poke it (fwinstall
-        # does), so feed it ourselves until the install finishes. Capped at 30
-        # minutes in case we lose the connection.
-        feeder = client.get_transport().open_session()
-        feeder.exec_command("i=0; while [ $i -lt 30 ]; do echo A > /dev/watchdog0; i=$((i+1)); sleep 60; done")
+        if feeder is None:
+            feeder = _stop_agent_for_flash(client)
 
         click.echo(f"Installing: {cmd} (this takes several minutes; do not interrupt)")
         chan = client.get_transport().open_session()

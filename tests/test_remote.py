@@ -2,10 +2,12 @@ import io
 import os
 
 import click
+import paramiko
 import pytest
 from click.testing import CliRunner
 from conftest import FakeClient
 
+from arcushub import cli as cli_mod
 from arcushub.cli import _download, _pump, _run, _upload, cli
 
 
@@ -77,6 +79,28 @@ def test_scp_round_trip(fake_hub, tmp_path):
     down = CliRunner().invoke(cli, ["scp", f"hub:{remote_dir}/local.bin", str(back)])
     assert down.exit_code == 0, down.output
     assert back.read_bytes() == src.read_bytes()
+
+
+@pytest.mark.parametrize("dest, expected", [("/", "/f"), ("/renamed", "/renamed")])
+def test_scp_into_the_root_directory(fake_hub, tmp_path, monkeypatch, dest, expected):
+    # Uploading to `/name` used to look for a parent directory called ''
+    src = tmp_path / "f"
+    src.write_text("x")
+    uploads = []
+    monkeypatch.setattr(cli_mod, "_upload", lambda client, f, size, path, label: uploads.append(path))
+
+    result = CliRunner().invoke(cli, ["scp", str(src), f"hub:{dest}"])
+    assert result.exit_code == 0, result.output
+    assert uploads == [expected]
+
+
+def test_upload_error_survives_cleanup_on_a_dead_connection(tmp_path, monkeypatch):
+    def dead(*args, **kwargs):
+        raise paramiko.SSHException("SSH session not active")
+
+    monkeypatch.setattr(cli_mod, "_run", dead)
+    with pytest.raises(click.ClickException, match="Upload to .* failed"):
+        _upload(FakeClient(), io.BytesIO(b"abc"), 3, str(tmp_path / "missing" / "x"), "up")
 
 
 def test_scp_missing_remote_dir(fake_hub, tmp_path):

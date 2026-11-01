@@ -25,12 +25,13 @@ pip install -e .
 Most commands accept a **host** argument that can be an IP address, hostname, or hub ID (e.g. `LWR-2389`). When a hub ID is provided, the tool resolves it to an IP address by:
 
 1. Checking a local cache (`~/.cache/arcushub/hosts.json`) with a quick reachability probe
-2. Checking the ARP table
+2. Checking the ARP table, and that the entry is still current
 3. Running SSDP/UPnP discovery to find the hub on the network
-4. Recognising a hub seen before by the UUID it announces in discovery
-5. Asking each remaining hub that answered discovery for its MAC over SSH
+4. Asking the hubs that answered discovery for their MAC over SSH, falling back on the UUID a hub announces if it was seen before and SSH can't settle it
 
 On macOS 27, Homebrew python (and so a default pipx install) gets an empty ARP table with no error. A hub then has to be identified over SSH once, after which step 4 recognises it even if SSH is closed or its IP changes. Known UUIDs are kept in `~/.cache/arcushub/hub_uuids.json`.
+
+`find`, `hubs` and `ping` take `--port`, `--user` and `--password` for those SSH checks.
 
 Hub IDs are derived from the hub's MAC address using a base-23 encoding scheme. The tool knows the Arcus OUI (`00:16:A2`) and can convert in both directions.
 
@@ -134,7 +135,9 @@ arcushub enable-dropbear LWR-2389
 
 #### `arcushub setup-ssh-key <host>`
 
-Push your local SSH public key to a hub for passwordless login. Auto-detects `~/.ssh/id_ed25519.pub`, falling back to `~/.ssh/id_rsa.pub`.
+Push your local SSH public key to a hub for passwordless login, then check the matching private key can log in. It works straight away, with no reboot. Auto-detects `~/.ssh/id_ed25519.pub`, falling back to `~/.ssh/id_rsa.pub`. A key given with `--key` is remembered in `~/.cache/arcushub/ssh_keys.json` and offered on later logins.
+
+arcushub doesn't use the SSH agent, so the private key has to be an unencrypted file. A key that can't log in is taken back off the hub, because a hub with SSH enabled and any key installed goes key-only and stops accepting passwords.
 
 ```sh
 arcushub setup-ssh-key LWR-2389
@@ -147,15 +150,29 @@ Agent lifecycle commands are grouped under `arcushub agent`.
 
 #### `arcushub agent restart <host>`
 
-Restart the hub agent (runs `agent_stop` then `agent_start`).
+Restart the hub agent with `killall java`, leaving `irisagentd` to start it again, as the hub does itself. If `irisagentd` isn't running, starts it through `/etc/init.d/irisagent`. Waits for a new agent to be running.
 
 ```sh
 arcushub agent restart LWR-2389
 ```
 
+#### `arcushub agent push <host> <jar...>`
+
+Install locally built jars on a hub and restart the agent. This is the command to use after building a single module.
+
+Uploads to a staging directory while the agent keeps running and checks each jar's MD5, so a failed push changes nothing. Then swaps the jars in, removes the stale `agent.jsa` and restarts the agent. Any other version of the same jar is replaced too, because every file in `libs` goes on the classpath. Replaced jars are kept in `/data/agent/libs.old`, and pushing a jar the hub already has does nothing.
+
+`--dry-run` shows what would change without changing it, `--no-restart` leaves the new jars for the next restart, and `--replace <jar>` names a jar to replace when it has a different name.
+
+```sh
+arcushub agent push LWR-2389 build/libs/arcus-zigbee-controller-2.13.29-SNAPSHOT.jar
+arcushub agent push LWR-2389 zigbee.jar zwave.jar --dry-run
+arcushub agent push LWR-2389 new.jar --replace old-2.13.25.jar --no-restart
+```
+
 #### `arcushub agent update <host>`
 
-Update changed agent jars from a local arcusplatform `distTar` build. Compares jars by MD5, uploads only the ones that differ, and restarts the agent. Use `--all` to upload every jar, or `--dist` to point at a different distributions directory (default: `~/projects/arcusplatform/.../distributions`).
+Update changed agent jars from a local arcusplatform `distTar` build. Compares jars by MD5, uploads the ones that differ to a staging directory while the agent keeps running, then swaps them in and restarts the agent. A failed upload changes nothing, but `/data` needs room for both copies. Use `--all` to upload every jar, or `--dist` to point at a different distributions directory (default: `~/projects/arcusplatform/.../distributions`).
 
 ```sh
 arcushub agent update LWR-2389
