@@ -76,13 +76,17 @@ arcushub ping 10.105.1.200
 
 #### `arcushub logs <host>`
 
-Download or follow `/tmp/hubAgent.log` on a hub. By default, downloads the full log file. Use `-f` to follow in real time.
+Download or follow `/tmp/hubAgent.log` on a hub. By default, downloads the full log file. Use `-f` to follow in real time, or `-o -` to print the log to stdout.
+
+When the agent exits, its supervisor moves the log to `/tmp/hubAgent.last` and starts a new agent. `--previous` reads that file, so you can see what led up to an agent crash or restart. The next restart replaces it, and a reboot clears both logs, since `/tmp` is in RAM.
 
 ```sh
-arcushub logs LWR-2389              # download full log
-arcushub logs LWR-2389 -o hub.log   # download to specific file
-arcushub logs LWR-2389 -f           # follow log in real time
-arcushub logs LWR-2389 -f -n 100    # follow, showing last 100 lines
+arcushub logs LWR-2389                         # download full log
+arcushub logs LWR-2389 -o hub.log              # download to specific file
+arcushub logs LWR-2389 -o - | grep -i zwave    # print the log to stdout
+arcushub logs LWR-2389 --previous              # download the log from before the last restart
+arcushub logs LWR-2389 -f                      # follow log in real time
+arcushub logs LWR-2389 -f -n 100               # follow, showing last 100 lines
 ```
 
 #### `arcushub flash <host> <firmware>`

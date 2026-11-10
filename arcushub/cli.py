@@ -479,21 +479,37 @@ def _upload(client, fileobj, size: int, remote_path: str, label: str) -> None:
         raise
 
 
-def _download(client, remote_path: str, local_path: Path, label: str) -> None:
-    """Stream remote_path into local_path. Removes the local file and raises ClickException on failure."""
-    prog = _Progress()
+def _cat(client, remote_path: str, out) -> None:
+    """Stream remote_path into the binary writer out. Raises ClickException if it can't be read."""
+    chan = client.get_transport().open_session()
+    chan.exec_command(f"cat {shlex.quote(remote_path)}")
     err = io.BytesIO()
+    status = _pump(chan, out, err)
+    if status != 0:
+        msg = err.getvalue().decode(errors="replace").strip() or f"exit code {status}"
+        raise click.ClickException(f"Failed to read {remote_path}: {msg}")
+
+
+def _download(client, remote_path: str, local_path: Path, label: str) -> None:
+    """Stream remote_path into local_path. Raises ClickException on failure.
+
+    The file arrives under a temporary name and replaces local_path only when it's
+    complete, so a failed download leaves an earlier copy as it was.
+    """
+    local_path = Path(local_path)
+    partial = local_path.with_name(f".{local_path.name}.partial")
+    prog = _Progress()
     try:
-        with _spinner(label, progress=prog), open(local_path, "wb") as f:
-            chan = client.get_transport().open_session()
-            chan.exec_command(f"cat {shlex.quote(remote_path)}")
-            status = _pump(chan, _CountingWriter(f, prog), err)
-            if status != 0:
-                msg = err.getvalue().decode(errors="replace").strip() or f"exit code {status}"
-                raise click.ClickException(f"Failed to read {remote_path}: {msg}")
-    except click.ClickException:
-        Path(local_path).unlink(missing_ok=True)
-        raise
+        with _spinner(label, progress=prog):
+            try:
+                f = open(partial, "wb")
+            except OSError as e:
+                raise click.ClickException(f"Can't write {local_path}: {e.strerror}") from e
+            with f:
+                _cat(client, remote_path, _CountingWriter(f, prog))
+            partial.replace(local_path)
+    finally:
+        partial.unlink(missing_ok=True)
 
 
 def _resolve_host(host: str, timeout: float = 5.0, port: int = 22,
@@ -1439,26 +1455,37 @@ def flash(host, firmware, port, user, password, kill_agent, skip_radio, wipe_age
         client.exec_command("/sbin/reboot")
 
 
+# irisagentd moves the log to hubAgent.last whenever the agent exits, then starts the next one
+_AGENT_LOG = "/tmp/hubAgent.log"
+_AGENT_LAST_LOG = "/tmp/hubAgent.last"
+
+
 @cli.command()
 @click.argument("host")
 @_hub_options
 @click.option("-f", "--follow", is_flag=True, help="Follow the log in real time (like tail -f).")
 @click.option("-n", "--lines", default=50, help="Number of lines to show when following.")
-@click.option("-o", "--output", type=click.Path(path_type=Path), default=None,
-              help="Save log to this file (default: hubAgent.log).")
-def logs(host, port, user, password, follow, lines, output):
+@click.option("--previous", is_flag=True, help="Read hubAgent.last, the log from before the last agent restart.")
+@click.option("-o", "--output", type=click.Path(allow_dash=True, dir_okay=False), default=None,
+              help="Save log to this file, or - for stdout (default: hubAgent.log, or hubAgent.last with --previous).")
+def logs(host, port, user, password, follow, lines, previous, output):
     """Download or follow /tmp/hubAgent.log on a hub. HOST can be an IP, hostname, or hub ID.
 
-    By default, downloads the full log file. Use -f to follow in real time.
+    By default, downloads the full log file. Use -f to follow in real time, -o - to
+    print it to stdout, or --previous for the log from before the agent last restarted.
 
     \b
     Examples:
-      arcushub logs LWR-2389              # download full log
-      arcushub logs LWR-2389 -o hub.log   # download to specific file
-      arcushub logs LWR-2389 -f           # follow log in real time
-      arcushub logs LWR-2389 -f -n 100    # follow, showing last 100 lines
+      arcushub logs LWR-2389                         # download full log
+      arcushub logs LWR-2389 -o hub.log              # download to specific file
+      arcushub logs LWR-2389 -o - | grep -i zwave    # print the log to stdout
+      arcushub logs LWR-2389 --previous              # download the log from before the last restart
+      arcushub logs LWR-2389 -f                      # follow log in real time
+      arcushub logs LWR-2389 -f -n 100               # follow, showing last 100 lines
     """
-    remote_path = "/tmp/hubAgent.log"
+    if follow and previous:
+        raise click.UsageError("--previous can't be followed: nothing writes to hubAgent.last.")
+    remote_path = _AGENT_LAST_LOG if previous else _AGENT_LOG
 
     with _hub_session(host, port, user, password) as client:
         if follow:
@@ -1468,6 +1495,8 @@ def logs(host, port, user, password, follow, lines, output):
                 _pump(chan, sys.stdout.buffer, sys.stderr.buffer)
             except KeyboardInterrupt:
                 pass
+        elif output == "-":
+            _cat(client, remote_path, sys.stdout.buffer)
         else:
-            local_path = output or Path("hubAgent.log")
+            local_path = Path(output or ("hubAgent.last" if previous else "hubAgent.log"))
             _download(client, remote_path, local_path, f"Downloading {remote_path} → {local_path}")
